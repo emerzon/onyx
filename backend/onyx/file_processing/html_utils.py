@@ -66,19 +66,34 @@ def parse_html_with_trafilatura(html_content: str) -> str:
     return strip_excessive_newlines_and_spaces(extracted_text) if extracted_text else ""
 
 
-def parse_html_with_trafilatura_markdown(html_content: str) -> str:
-    """Parse HTML content using markdownify for better table handling."""
+def convert_html_to_markdown(
+    html_content: str,
+    ui_elements_to_remove: list[str] | None = None
+) -> str:
+    """Convert HTML content to markdown format with optional UI element removal.
+    
+    Args:
+        html_content: The HTML content to convert
+        ui_elements_to_remove: Optional list of CSS selectors for UI elements to remove
+                              before conversion (e.g., ['.dataTables_filter', 'button'])
+    
+    Returns:
+        Markdown formatted text
+    """
+    # Default UI elements commonly found in web tables that should be removed
+    default_ui_selectors = [
+        '.dataTables_filter', '.dataTables_info', '.dataTables_paginate',
+        '.dropdown-menu', 'input[type="search"]', 'input[type="text"]', 
+        'button', 'svg'
+    ]
+    
+    # Use provided selectors or defaults
+    ui_selectors = ui_elements_to_remove if ui_elements_to_remove is not None else default_ui_selectors
+    
     # Clean up the HTML first to remove problematic elements
     soup = bs4.BeautifulSoup(html_content, "html.parser")
     
-    # Remove DataTables UI elements that confuse conversion but keep tables
-    ui_selectors = [
-        '.dataTables_filter', '.dataTables_info', '.dataTables_paginate',
-        '.zDocsFilterTableDiv', '.zDocsTopicPageTableExportButton',
-        '.dropdown-menu', '.searchTableDiv', 'input[type="search"]',
-        'input[type="text"]', 'button', 'svg'
-    ]
-    
+    # Remove UI elements that confuse conversion but keep tables
     for selector in ui_selectors:
         for element in soup.select(selector):
             element.decompose()

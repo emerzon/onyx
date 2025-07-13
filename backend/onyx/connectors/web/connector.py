@@ -1,25 +1,22 @@
+"""
+Web Connector implementation using Crawlee library.
+This module replaces the Playwright-based web scraping with Crawlee's more robust framework.
+"""
+
+import hashlib
 import io
 import ipaddress
-import random
 import socket
-import time
-from datetime import datetime
-from datetime import timezone
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
-from typing import cast
-from typing import Tuple
-from urllib.parse import urljoin
-from urllib.parse import urlparse
+from typing import Any, AsyncGenerator, Optional, cast
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from crawlee.crawlers import AdaptivePlaywrightCrawler
 from oauthlib.oauth2 import BackendApplicationClient
-from playwright.sync_api import BrowserContext
-from playwright.sync_api import Playwright
-from playwright.sync_api import sync_playwright
-from requests_oauthlib import OAuth2Session  # type:ignore
-from urllib3.exceptions import MaxRetryError
+from requests_oauthlib import OAuth2Session
 
 from onyx.configs.app_configs import INDEX_BATCH_SIZE
 from onyx.configs.app_configs import WEB_CONNECTOR_OAUTH_CLIENT_ID
@@ -36,64 +33,19 @@ from onyx.connectors.interfaces import LoadConnector
 from onyx.connectors.models import Document
 from onyx.connectors.models import TextSection
 from onyx.file_processing.extract_file_text import read_pdf_file
-from onyx.file_processing.html_utils import web_html_cleanup
+from onyx.file_processing.html_utils import web_html_cleanup, convert_html_to_markdown
 from onyx.utils.logger import setup_logger
-from onyx.utils.sitemap import list_pages_for_site
+from onyx.connectors.web.extractors import ExtractorFactory
 from shared_configs.configs import MULTI_TENANT
 
 logger = setup_logger()
 
 
-class ScrapeSessionContext:
-    """Session level context for scraping"""
-
-    def __init__(self, base_url: str, to_visit: list[str]):
-        self.base_url = base_url
-        self.to_visit = to_visit
-        self.visited_links: set[str] = set()
-        self.content_hashes: set[int] = set()
-
-        self.doc_batch: list[Document] = []
-
-        self.at_least_one_doc: bool = False
-        self.last_error: str | None = None
-        self.needs_retry: bool = False
-
-        self.playwright: Playwright | None = None
-        self.playwright_context: BrowserContext | None = None
-
-    def initialize(self) -> None:
-        self.stop()
-        self.playwright, self.playwright_context = start_playwright()
-
-    def stop(self) -> None:
-        if self.playwright_context:
-            self.playwright_context.close()
-            self.playwright_context = None
-
-        if self.playwright:
-            self.playwright.stop()
-            self.playwright = None
-
-
-class ScrapeResult:
-    doc: Document | None = None
-    retry: bool = False
-
-
-WEB_CONNECTOR_MAX_SCROLL_ATTEMPTS = 20
-# Threshold for determining when to replace vs append iframe content
-IFRAME_TEXT_LENGTH_THRESHOLD = 700
-# Message indicating JavaScript is disabled, which often appears when scraping fails
-JAVASCRIPT_DISABLED_MESSAGE = "You have JavaScript disabled in your browser"
-
-# Define common headers that mimic a real browser
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-)
 DEFAULT_HEADERS = {
-    "User-Agent": DEFAULT_USER_AGENT,
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    ),
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
         "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
@@ -111,52 +63,36 @@ DEFAULT_HEADERS = {
     "Sec-CH-UA-Platform": '"macOS"',
 }
 
-# Common PDF MIME types
-PDF_MIME_TYPES = [
-    "application/pdf",
-    "application/x-pdf",
-    "application/acrobat",
-    "application/vnd.pdf",
-    "text/pdf",
-    "text/x-pdf",
-]
-
 
 class WEB_CONNECTOR_VALID_SETTINGS(str, Enum):
-    # Given a base site, index everything under that path
     RECURSIVE = "recursive"
-    # Given a URL, index only the given page
     SINGLE = "single"
-    # Given a sitemap.xml URL, parse all the pages in it
     SITEMAP = "sitemap"
-    # Given a file upload where every line is a URL, parse all the URLs provided
     UPLOAD = "upload"
 
 
+
+WEB_CONNECTOR_MAX_SCROLL_ATTEMPTS = 20
+IFRAME_TEXT_LENGTH_THRESHOLD = 700
+JAVASCRIPT_DISABLED_MESSAGE = "You have JavaScript disabled in your browser"
+
+
 def protected_url_check(url: str) -> None:
-    """Couple considerations:
-    - DNS mapping changes over time so we don't want to cache the results
-    - Fetching this is assumed to be relatively fast compared to other bottlenecks like reading
-      the page or embedding the contents
-    - To be extra safe, all IPs associated with the URL must be global
-    - This is to prevent misuse and not explicit attacks
-    """
+    """Validates that URL points to a globally accessible resource."""
     if not WEB_CONNECTOR_VALIDATE_URLS:
         return
 
-    parse = urlparse(url)
-    if parse.scheme != "http" and parse.scheme != "https":
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
         raise ValueError("URL must be of scheme https?://")
 
-    if not parse.hostname:
+    if not parsed.hostname:
         raise ValueError("URL must include a hostname")
 
     try:
-        # This may give a large list of IP addresses for domains with extensive DNS configurations
-        # such as large distributed systems of CDNs
-        info = socket.getaddrinfo(parse.hostname, None)
+        info = socket.getaddrinfo(parsed.hostname, None)
     except socket.gaierror as e:
-        raise ConnectionError(f"DNS resolution failed for {parse.hostname}: {e}")
+        raise ConnectionError(f"DNS resolution failed for {parsed.hostname}: {e}")
 
     for address in info:
         ip = address[4][0]
@@ -167,218 +103,29 @@ def protected_url_check(url: str) -> None:
             )
 
 
-def check_internet_connection(url: str) -> None:
-    try:
-        # Use a more realistic browser-like request
-        session = requests.Session()
-        session.headers.update(DEFAULT_HEADERS)
 
-        response = session.get(url, timeout=5, allow_redirects=True)
 
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        # Extract status code from the response, defaulting to -1 if response is None
-        status_code = e.response.status_code if e.response is not None else -1
-
-        # For 403 errors, we do have internet connection, but the request is blocked by the server
-        # this is usually due to bot detection. Future calls (via Playwright) will usually get
-        # around this.
-        if status_code == 403:
-            logger.warning(
-                f"Received 403 Forbidden for {url}, will retry with browser automation"
-            )
-            return
-
-        error_msg = {
-            400: "Bad Request",
-            401: "Unauthorized",
-            403: "Forbidden",
-            404: "Not Found",
-            500: "Internal Server Error",
-            502: "Bad Gateway",
-            503: "Service Unavailable",
-            504: "Gateway Timeout",
-        }.get(status_code, "HTTP Error")
-        raise Exception(f"{error_msg} ({status_code}) for {url} - {e}")
-    except requests.exceptions.SSLError as e:
-        cause = (
-            e.args[0].reason
-            if isinstance(e.args, tuple) and isinstance(e.args[0], MaxRetryError)
-            else e.args
-        )
-        raise Exception(f"SSL error {str(cause)}")
-    except (requests.RequestException, ValueError) as e:
-        raise Exception(f"Unable to reach {url} - check your internet connection: {e}")
 
 
 def is_valid_url(url: str) -> bool:
+    """Check if a URL is valid."""
     try:
         result = urlparse(url)
         return all([result.scheme, result.netloc])
-    except ValueError:
+    except Exception:
         return False
 
 
-def get_internal_links(
-    base_url: str, url: str, soup: BeautifulSoup, should_ignore_pound: bool = True
-) -> set[str]:
-    internal_links = set()
-    for link in cast(list[dict[str, Any]], soup.find_all("a")):
-        href = cast(str | None, link.get("href"))
-        if not href:
-            continue
-
-        # Account for malformed backslashes in URLs
-        href = href.replace("\\", "/")
-
-        # "#!" indicates the page is using a hashbang URL, which is a client-side routing technique
-        if should_ignore_pound and "#" in href and "#!" not in href:
-            href = href.split("#")[0]
-
-        if not is_valid_url(href):
-            # Relative path handling
-            href = urljoin(url, href)
-
-        if urlparse(href).netloc == urlparse(url).netloc and base_url in href:
-            internal_links.add(href)
-    return internal_links
-
-
-def is_pdf_content(response: requests.Response) -> bool:
-    """Check if the response contains PDF content based on content-type header"""
-    content_type = response.headers.get("content-type", "").lower()
-    return any(pdf_type in content_type for pdf_type in PDF_MIME_TYPES)
-
-
-def start_playwright() -> Tuple[Playwright, BrowserContext]:
-    playwright = sync_playwright().start()
-
-    # Launch browser with more realistic settings
-    browser = playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--disable-site-isolation-trials",
-        ],
-    )
-
-    # Create a context with realistic browser properties
-    context = browser.new_context(
-        user_agent=DEFAULT_USER_AGENT,
-        viewport={"width": 1440, "height": 900},
-        device_scale_factor=2.0,
-        locale="en-US",
-        timezone_id="America/Los_Angeles",
-        has_touch=False,
-        java_script_enabled=True,
-        color_scheme="light",
-        # Add more realistic browser properties
-        bypass_csp=True,
-        ignore_https_errors=True,
-    )
-
-    # Set additional headers to mimic a real browser
-    context.set_extra_http_headers(
-        {
-            "Accept": DEFAULT_HEADERS["Accept"],
-            "Accept-Language": DEFAULT_HEADERS["Accept-Language"],
-            "Sec-Fetch-Dest": DEFAULT_HEADERS["Sec-Fetch-Dest"],
-            "Sec-Fetch-Mode": DEFAULT_HEADERS["Sec-Fetch-Mode"],
-            "Sec-Fetch-Site": DEFAULT_HEADERS["Sec-Fetch-Site"],
-            "Sec-Fetch-User": DEFAULT_HEADERS["Sec-Fetch-User"],
-            "Sec-CH-UA": DEFAULT_HEADERS["Sec-CH-UA"],
-            "Sec-CH-UA-Mobile": DEFAULT_HEADERS["Sec-CH-UA-Mobile"],
-            "Sec-CH-UA-Platform": DEFAULT_HEADERS["Sec-CH-UA-Platform"],
-            "Cache-Control": "max-age=0",
-            "DNT": "1",
-        }
-    )
-
-    # Add a script to modify navigator properties to avoid detection
-    context.add_init_script(
-        """
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
-        });
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5]
-        });
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en']
-        });
-    """
-    )
-
-    if (
-        WEB_CONNECTOR_OAUTH_CLIENT_ID
-        and WEB_CONNECTOR_OAUTH_CLIENT_SECRET
-        and WEB_CONNECTOR_OAUTH_TOKEN_URL
-    ):
-        client = BackendApplicationClient(client_id=WEB_CONNECTOR_OAUTH_CLIENT_ID)
-        oauth = OAuth2Session(client=client)
-        token = oauth.fetch_token(
-            token_url=WEB_CONNECTOR_OAUTH_TOKEN_URL,
-            client_id=WEB_CONNECTOR_OAUTH_CLIENT_ID,
-            client_secret=WEB_CONNECTOR_OAUTH_CLIENT_SECRET,
-        )
-        context.set_extra_http_headers(
-            {"Authorization": "Bearer {}".format(token["access_token"])}
-        )
-
-    return playwright, context
-
-
-def extract_urls_from_sitemap(sitemap_url: str) -> list[str]:
-    try:
-        response = requests.get(sitemap_url, headers=DEFAULT_HEADERS)
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.content, "html.parser")
-        urls = [
-            _ensure_absolute_url(sitemap_url, loc_tag.text)
-            for loc_tag in soup.find_all("loc")
-        ]
-
-        if len(urls) == 0 and len(soup.find_all("urlset")) == 0:
-            # the given url doesn't look like a sitemap, let's try to find one
-            urls = list_pages_for_site(sitemap_url)
-
-        if len(urls) == 0:
-            raise ValueError(
-                f"No URLs found in sitemap {sitemap_url}. Try using the 'single' or 'recursive' scraping options instead."
-            )
-
-        return urls
-    except requests.RequestException as e:
-        raise RuntimeError(f"Failed to fetch sitemap from {sitemap_url}: {e}")
-    except ValueError as e:
-        raise RuntimeError(f"Error processing sitemap {sitemap_url}: {e}")
-    except Exception as e:
-        raise RuntimeError(
-            f"Unexpected error while processing sitemap {sitemap_url}: {e}"
-        )
-
-
-def _ensure_absolute_url(source_url: str, maybe_relative_url: str) -> str:
-    if not urlparse(maybe_relative_url).netloc:
-        return urljoin(source_url, maybe_relative_url)
-    return maybe_relative_url
-
-
-def _ensure_valid_url(url: str) -> str:
-    if "://" not in url:
-        return "https://" + url
-    return url
-
-
 def _read_urls_file(location: str) -> list[str]:
+    """Read URLs from a file."""
     with open(location, "r") as f:
-        urls = [_ensure_valid_url(line.strip()) for line in f if line.strip()]
+        urls = [line.strip() if "://" in line.strip() else f"https://{line.strip()}" 
+                for line in f if line.strip()]
     return urls
 
 
 def _get_datetime_from_last_modified_header(last_modified: str) -> datetime | None:
+    """Parse Last-Modified header into datetime."""
     try:
         return datetime.strptime(last_modified, "%a, %d %b %Y %H:%M:%S %Z").replace(
             tzinfo=timezone.utc
@@ -387,337 +134,425 @@ def _get_datetime_from_last_modified_header(last_modified: str) -> datetime | No
         return None
 
 
-def _handle_cookies(context: BrowserContext, url: str) -> None:
-    """Handle cookies for the given URL to help with bot detection"""
-    try:
-        # Parse the URL to get the domain
-        parsed_url = urlparse(url)
-        domain = parsed_url.netloc
-
-        # Add some common cookies that might help with bot detection
-        cookies: list[dict[str, str]] = [
-            {
-                "name": "cookieconsent",
-                "value": "accepted",
-                "domain": domain,
-                "path": "/",
-            },
-            {
-                "name": "consent",
-                "value": "true",
-                "domain": domain,
-                "path": "/",
-            },
-            {
-                "name": "session",
-                "value": "random_session_id",
-                "domain": domain,
-                "path": "/",
-            },
-        ]
-
-        # Add cookies to the context
-        for cookie in cookies:
-            try:
-                context.add_cookies([cookie])  # type: ignore
-            except Exception as e:
-                logger.debug(f"Failed to add cookie {cookie['name']} for {domain}: {e}")
-    except Exception:
-        logger.exception(
-            f"Unexpected error while handling cookies for Web Connector with URL {url}"
-        )
-
-
-class WebConnector(LoadConnector):
-    MAX_RETRIES = 3
-
+class WebConnectorCrawlee(LoadConnector):
+    """Web connector implementation using Crawlee library."""
+    
     def __init__(
         self,
-        base_url: str,  # Can't change this without disrupting existing users
+        base_url: str,
         web_connector_type: str = WEB_CONNECTOR_VALID_SETTINGS.RECURSIVE.value,
-        mintlify_cleanup: bool = True,  # Mostly ok to apply to other websites as well
+        mintlify_cleanup: bool = True,
         batch_size: int = INDEX_BATCH_SIZE,
-        scroll_before_scraping: bool = False,
+        enable_specialized_extraction: bool = True,
         **kwargs: Any,
     ) -> None:
+        self.base_url = base_url if "://" in base_url else f"https://{base_url}"
         self.mintlify_cleanup = mintlify_cleanup
         self.batch_size = batch_size
-        self.recursive = False
-        self.scroll_before_scraping = scroll_before_scraping
         self.web_connector_type = web_connector_type
+        
+        # Initialize URLs based on connector type
         if web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.RECURSIVE.value:
+            self.initial_urls = [self.base_url]
             self.recursive = True
-            self.to_visit_list = [_ensure_valid_url(base_url)]
-            return
-
         elif web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.SINGLE.value:
-            self.to_visit_list = [_ensure_valid_url(base_url)]
-
-        elif web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.SITEMAP:
-            self.to_visit_list = extract_urls_from_sitemap(_ensure_valid_url(base_url))
-
-        elif web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.UPLOAD:
-            # Explicitly check if running in multi-tenant mode to prevent potential security risks
+            self.initial_urls = [self.base_url]
+            self.recursive = False
+        elif web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.SITEMAP.value:
+            self.initial_urls = self._extract_sitemap_urls(self.base_url)
+            self.recursive = False
+        elif web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.UPLOAD.value:
             if MULTI_TENANT:
                 raise ValueError(
                     "Upload input for web connector is not supported in cloud environments"
                 )
-
             logger.warning(
                 "This is not a UI supported Web Connector flow, "
                 "are you sure you want to do this?"
             )
-            self.to_visit_list = _read_urls_file(base_url)
-
+            self.initial_urls = _read_urls_file(base_url)
+            self.recursive = False
         else:
             raise ValueError(
-                "Invalid Web Connector Config, must choose a valid type between: " ""
+                f"Invalid Web Connector Config, must choose a valid type: "
+                f"{[e.value for e in WEB_CONNECTOR_VALID_SETTINGS]}"
             )
+        
+        # OAuth setup if configured
+        self.oauth_token = None
+        if (
+            WEB_CONNECTOR_OAUTH_CLIENT_ID
+            and WEB_CONNECTOR_OAUTH_CLIENT_SECRET
+            and WEB_CONNECTOR_OAUTH_TOKEN_URL
+        ):
+            client = BackendApplicationClient(client_id=WEB_CONNECTOR_OAUTH_CLIENT_ID)
+            oauth = OAuth2Session(client=client)
+            token = oauth.fetch_token(
+                token_url=WEB_CONNECTOR_OAUTH_TOKEN_URL,
+                client_id=WEB_CONNECTOR_OAUTH_CLIENT_ID,
+                client_secret=WEB_CONNECTOR_OAUTH_CLIENT_SECRET,
+            )
+            self.oauth_token = token["access_token"]
+        
+        # State tracking
+        self.content_hashes: set[str] = set()  # Using stable MD5 hashes for content deduplication
+        self.documents: list[Document] = []
+        
+        # Initialize extractor factory for specialized content extraction
+        self.enable_specialized_extraction = enable_specialized_extraction
+        self.extractor_factory = ExtractorFactory() if enable_specialized_extraction else None
+        
+        # Incremental batching support
+        self._batch_queue: list[list[Document]] = []
+        self._current_batch: list[Document] = []
+
+    def _extract_sitemap_urls(self, sitemap_url: str) -> list[str]:
+        """Extract URLs from a sitemap using simple BeautifulSoup parsing."""
+        # If URL doesn't end with .xml, try to find the sitemap automatically
+        if not sitemap_url.endswith('.xml'):
+            sitemap_url = self._discover_sitemap_url(sitemap_url)
+        
+        try:
+            response = requests.get(sitemap_url, headers=DEFAULT_HEADERS, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, "xml")
+            loc_tags = soup.find_all("loc")
+            
+            if not loc_tags:
+                raise ValueError(
+                    f"No URLs found in sitemap {sitemap_url}. Try using 'single' or 'recursive' scraping instead."
+                )
+            
+            # Check if this is a sitemap index (contains other sitemaps)
+            all_urls = []
+            for loc_tag in loc_tags:
+                url = urljoin(sitemap_url, loc_tag.text) if not urlparse(loc_tag.text).netloc else loc_tag.text
+                
+                # If URL ends with .xml, it might be a nested sitemap
+                if url.endswith('.xml') and url != sitemap_url:
+                    logger.info(f"Processing nested sitemap: {url}")
+                    try:
+                        nested_urls = self._extract_sitemap_urls(url)
+                        all_urls.extend(nested_urls)
+                    except Exception as e:
+                        logger.warning(f"Failed to process nested sitemap {url}: {e}")
+                        # Add the sitemap URL itself as fallback
+                        all_urls.append(url)
+                else:
+                    all_urls.append(url)
+            
+            return all_urls
+        except requests.RequestException as e:
+            raise RuntimeError(f"Failed to fetch sitemap from {sitemap_url}: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Unexpected error processing sitemap {sitemap_url}: {e}")
+
+    def _discover_sitemap_url(self, base_url: str) -> str:
+        """Discover sitemap URL from base URL by trying common locations."""
+        # Ensure base URL ends with /
+        if not base_url.endswith('/'):
+            base_url += '/'
+        
+        # Common sitemap locations to try
+        sitemap_paths = [
+            'sitemap.xml',
+            'sitemap_index.xml', 
+            'sitemaps.xml',
+            'sitemap/sitemap.xml',
+            'wp-sitemap.xml',  # WordPress
+        ]
+        
+        for path in sitemap_paths:
+            sitemap_url = urljoin(base_url, path)
+            try:
+                response = requests.head(sitemap_url, headers=DEFAULT_HEADERS, timeout=10)
+                if response.status_code == 200:
+                    logger.info(f"Found sitemap at: {sitemap_url}")
+                    return sitemap_url
+            except requests.RequestException:
+                continue
+        
+        # If no sitemap found, check robots.txt
+        try:
+            robots_url = urljoin(base_url, 'robots.txt')
+            response = requests.get(robots_url, headers=DEFAULT_HEADERS, timeout=10)
+            if response.status_code == 200:
+                for line in response.text.split('\n'):
+                    line = line.strip()
+                    if line.lower().startswith('sitemap:'):
+                        sitemap_url = line.split(':', 1)[1].strip()
+                        logger.info(f"Found sitemap in robots.txt: {sitemap_url}")
+                        return sitemap_url
+        except requests.RequestException:
+            pass
+        
+        # Default fallback
+        default_sitemap = urljoin(base_url, 'sitemap.xml')
+        logger.info(f"No sitemap found, defaulting to: {default_sitemap}")
+        return default_sitemap
 
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
         if credentials:
             logger.warning("Unexpected credentials provided for Web Connector")
         return None
-
-    def _do_scrape(
-        self,
-        index: int,
-        initial_url: str,
-        session_ctx: ScrapeSessionContext,
-    ) -> ScrapeResult:
-        """Returns a ScrapeResult object with a doc and retry flag."""
-
-        if session_ctx.playwright is None:
-            raise RuntimeError("scrape_context.playwright is None")
-
-        if session_ctx.playwright_context is None:
-            raise RuntimeError("scrape_context.playwright_context is None")
-
-        result = ScrapeResult()
-
-        # Handle cookies for the URL
-        _handle_cookies(session_ctx.playwright_context, initial_url)
-
-        # First do a HEAD request to check content type without downloading the entire content
-        head_response = requests.head(
-            initial_url, headers=DEFAULT_HEADERS, allow_redirects=True
-        )
-        is_pdf = is_pdf_content(head_response)
-
-        if is_pdf or initial_url.lower().endswith(".pdf"):
-            # PDF files are not checked for links
-            response = requests.get(initial_url, headers=DEFAULT_HEADERS)
-            page_text, metadata, images = read_pdf_file(
-                file=io.BytesIO(response.content)
-            )
-            last_modified = response.headers.get("Last-Modified")
-
-            result.doc = Document(
-                id=initial_url,
-                sections=[TextSection(link=initial_url, text=page_text)],
-                source=DocumentSource.WEB,
-                semantic_identifier=initial_url.split("/")[-1],
-                metadata=metadata,
-                doc_updated_at=(
-                    _get_datetime_from_last_modified_header(last_modified)
-                    if last_modified
-                    else None
-                ),
-            )
-
-            return result
-
-        page = session_ctx.playwright_context.new_page()
+    
+    async def _handle_pdf_from_context(self, context) -> Document | None:
+        """Handle PDF text extraction from Crawlee context."""
+        url = context.request.url
         try:
-            # Can't use wait_until="networkidle" because it interferes with the scrolling behavior
-            page_response = page.goto(
-                initial_url,
-                timeout=30000,  # 30 seconds
-                wait_until="domcontentloaded",  # Wait for DOM to be ready
-            )
-
-            last_modified = (
-                page_response.header_value("Last-Modified") if page_response else None
-            )
-            final_url = page.url
-            if final_url != initial_url:
-                protected_url_check(final_url)
-                initial_url = final_url
-                if initial_url in session_ctx.visited_links:
-                    logger.info(
-                        f"{index}: {initial_url} redirected to {final_url} - already indexed"
-                    )
-                    page.close()
-                    return result
-
-                logger.info(f"{index}: {initial_url} redirected to {final_url}")
-                session_ctx.visited_links.add(initial_url)
-
-            # If we got here, the request was successful
-            if self.scroll_before_scraping:
-                scroll_attempts = 0
-                previous_height = page.evaluate("document.body.scrollHeight")
-                while scroll_attempts < WEB_CONNECTOR_MAX_SCROLL_ATTEMPTS:
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    # wait for the content to load if we scrolled
-                    page.wait_for_load_state("networkidle", timeout=30000)
-                    time.sleep(0.5)  # let javascript run
-
-                    new_height = page.evaluate("document.body.scrollHeight")
-                    if new_height == previous_height:
-                        break  # Stop scrolling when no more content is loaded
-                    previous_height = new_height
-                    scroll_attempts += 1
-
-            content = page.content()
-            soup = BeautifulSoup(content, "html.parser")
-
-            if self.recursive:
-                internal_links = get_internal_links(
-                    session_ctx.base_url, initial_url, soup
-                )
-                for link in internal_links:
-                    if link not in session_ctx.visited_links:
-                        session_ctx.to_visit.append(link)
-
-            if page_response and str(page_response.status)[0] in ("4", "5"):
-                session_ctx.last_error = f"Skipped indexing {initial_url} due to HTTP {page_response.status} response"
-                logger.info(session_ctx.last_error)
-                result.retry = True
-                return result
-
-            # after this point, we don't need the caller to retry
-            parsed_html = web_html_cleanup(soup, self.mintlify_cleanup)
-
-            """For websites containing iframes that need to be scraped,
-            the code below can extract text from within these iframes.
-            """
-            logger.debug(
-                f"{index}: Length of cleaned text {len(parsed_html.cleaned_text)}"
-            )
-            if JAVASCRIPT_DISABLED_MESSAGE in parsed_html.cleaned_text:
-                iframe_count = page.frame_locator("iframe").locator("html").count()
-                if iframe_count > 0:
-                    iframe_texts = (
-                        page.frame_locator("iframe").locator("html").all_inner_texts()
-                    )
-                    document_text = "\n".join(iframe_texts)
-                    """ 700 is the threshold value for the length of the text extracted
-                    from the iframe based on the issue faced """
-                    if len(parsed_html.cleaned_text) < IFRAME_TEXT_LENGTH_THRESHOLD:
-                        parsed_html.cleaned_text = document_text
-                    else:
-                        parsed_html.cleaned_text += "\n" + document_text
-
-            # Sometimes pages with #! will serve duplicate content
-            # There are also just other ways this can happen
-            hashed_text = hash((parsed_html.title, parsed_html.cleaned_text))
-            if hashed_text in session_ctx.content_hashes:
-                logger.info(
-                    f"{index}: Skipping duplicate title + content for {initial_url}"
-                )
-                return result
-
-            session_ctx.content_hashes.add(hashed_text)
-
-            result.doc = Document(
-                id=initial_url,
-                sections=[TextSection(link=initial_url, text=parsed_html.cleaned_text)],
+            # Get PDF content from Crawlee's response
+            if hasattr(context, 'response') and context.response:
+                pdf_content = context.response.body
+            else:
+                # Fallback: download PDF directly
+                response = requests.get(url, headers=DEFAULT_HEADERS, timeout=30)
+                response.raise_for_status()
+                pdf_content = response.content
+            
+            # Extract text using our PDF processing function
+            page_text, metadata, images = read_pdf_file(file=io.BytesIO(pdf_content))
+            
+            # Get last modified header if available
+            last_modified = None
+            if hasattr(context, 'response') and context.response and hasattr(context.response, 'headers'):
+                last_modified = context.response.headers.get("Last-Modified")
+            
+            return Document(
+                id=url,
+                sections=[TextSection(link=url, text=page_text)],
                 source=DocumentSource.WEB,
-                semantic_identifier=parsed_html.title or initial_url,
-                metadata={},
-                doc_updated_at=(
-                    _get_datetime_from_last_modified_header(last_modified)
-                    if last_modified
-                    else None
-                ),
+                semantic_identifier=url.split("/")[-1],
+                metadata=metadata,
+                doc_updated_at=_get_datetime_from_last_modified_header(last_modified) if last_modified else None,
             )
-        finally:
-            page.close()
+        except Exception as e:
+            logger.error(f"Failed to process PDF {url}: {e}")
+            return None
 
-        return result
+    def _add_document_to_batch(self, doc: Document) -> None:
+        """Add document to current batch and queue completed batches."""
+        self._current_batch.append(doc)
+        self.documents.append(doc)  # Keep for compatibility and final processing
+        
+        # Check if we've reached batch size
+        if len(self._current_batch) >= self.batch_size:
+            # Queue the completed batch
+            self._batch_queue.append(self._current_batch.copy())
+            logger.info(f"Queued batch of {len(self._current_batch)} documents")
+            self._current_batch.clear()
+    
+    def _get_next_batch(self) -> Optional[list[Document]]:
+        """Get the next available batch from the queue."""
+        if self._batch_queue:
+            return self._batch_queue.pop(0)
+        return None
+    
+    def _finalize_batches(self) -> None:
+        """Add any remaining documents as a final batch."""
+        if self._current_batch:
+            self._batch_queue.append(self._current_batch.copy())
+            logger.info(f"Queued final batch of {len(self._current_batch)} documents")
+            self._current_batch.clear()
+
+
+    def _extract_content(self, url: str, soup: BeautifulSoup, raw_html: str) -> tuple[str | None, str, dict[str, Any]]:
+        """Extract content using specialized extractors or fallback methods."""
+        # Try specialized extractor first
+        if self.extractor_factory:
+            extractor = self.extractor_factory.get_extractor(soup, url)
+            if extractor:
+                extracted = extractor.extract_content(soup, url)
+                return extracted.title, extracted.content, extracted.metadata or {}
+        
+        # Fallback to standard extraction
+        title = soup.title.string if soup.title else None
+        text_content = convert_html_to_markdown(raw_html)
+        
+        # Final fallback to traditional cleanup if needed
+        if not text_content or len(text_content) < 50:
+            parsed_html = web_html_cleanup(soup, self.mintlify_cleanup)
+            title = parsed_html.title
+            text_content = parsed_html.cleaned_text
+        
+        return title, text_content, {}
+
+    async def _handle_adaptive_page(self, context) -> None:
+        """Handle page processing with AdaptivePlaywrightCrawler."""
+        url = context.request.url
+        
+        try:
+            # Validate URL
+            protected_url_check(url)
+            
+            # Get content from adaptive context (Crawlee handles Playwright vs static automatically)
+            if hasattr(context, 'page') and context.page is not None:
+                logger.info(f"Processing with Playwright: {url}")
+                raw_html = await context.page.content()
+                soup = BeautifulSoup(raw_html, "html.parser")
+            elif hasattr(context, 'soup') and context.soup is not None:
+                logger.info(f"Processing with static parser: {url}")
+                soup = context.soup
+                raw_html = str(soup)
+            else:
+                logger.warning(f"No page or soup available for {url}")
+                return
+            
+            # Extract content using specialized extractors or fallback
+            title, text_content, metadata = self._extract_content(url, soup, raw_html)
+            
+            # Add discovered links for recursive crawling (Crawlee handles deduplication)
+            if self.recursive:
+                await context.enqueue_links(strategy="same-hostname")
+            
+            # Check for duplicate content using stable hash
+            content_key = f"{title}:{text_content}"
+            content_hash = hashlib.md5(content_key.encode("utf-8")).hexdigest()
+            
+            if content_hash in self.content_hashes:
+                logger.info(f"Skipping duplicate content for {url}")
+                return
+            
+            self.content_hashes.add(content_hash)
+            
+            # Create and batch document
+            last_modified = getattr(context.response, 'headers', {}).get("Last-Modified") if hasattr(context, 'response') else None
+            
+            doc = Document(
+                id=url,
+                sections=[TextSection(link=url, text=text_content)],
+                source=DocumentSource.WEB,
+                semantic_identifier=title or url,
+                metadata=metadata,
+                doc_updated_at=_get_datetime_from_last_modified_header(last_modified) if last_modified else None,
+            )
+            
+            self._add_document_to_batch(doc)
+            
+        except Exception as e:
+            logger.error(f"Error processing {url}: {e}")
+
+
+    async def _extract_iframe_content(self, page: Any, parsed_html: Any) -> None:
+        """Extract content from iframes."""
+        try:
+            iframe_count = await page.locator("iframe").count()
+            if iframe_count > 0:
+                iframe_texts = []
+                for i in range(iframe_count):
+                    try:
+                        frame = page.frame_locator("iframe").nth(i)
+                        text = await frame.locator("body").inner_text()
+                        iframe_texts.append(text)
+                    except Exception as e:
+                        logger.debug(f"Failed to extract iframe {i}: {e}")
+                
+                if iframe_texts:
+                    combined_iframe_text = "\n".join(iframe_texts)
+                    if len(parsed_html.cleaned_text) < IFRAME_TEXT_LENGTH_THRESHOLD:
+                        parsed_html.cleaned_text = combined_iframe_text
+                    else:
+                        parsed_html.cleaned_text += "\n" + combined_iframe_text
+        except Exception as e:
+            logger.debug(f"Error extracting iframe content: {e}")
 
     def load_from_state(self) -> GenerateDocumentsOutput:
-        """Traverses through all pages found on the website
-        and converts them into documents"""
-
-        if not self.to_visit_list:
-            raise ValueError("No URLs to visit")
-
-        base_url = self.to_visit_list[0]  # For the recursive case
-        check_internet_connection(base_url)  # make sure we can connect to the base url
-
-        session_ctx = ScrapeSessionContext(base_url, self.to_visit_list)
-        session_ctx.initialize()
-
-        while session_ctx.to_visit:
-            initial_url = session_ctx.to_visit.pop()
-            if initial_url in session_ctx.visited_links:
-                continue
-            session_ctx.visited_links.add(initial_url)
-
+        """Main entry point for document generation using Crawlee with incremental batching."""
+        import asyncio
+        import threading
+        import time
+        
+        async def crawl() -> None:
+            # Use AdaptivePlaywrightCrawler with BeautifulSoup static parser
+            # This automatically determines when to use JavaScript vs static parsing
+            crawler = AdaptivePlaywrightCrawler.with_beautifulsoup_static_parser(
+                playwright_crawler_specific_kwargs={
+                    "browser_launch_options": {
+                        "args": [
+                            "--no-sandbox", 
+                            "--disable-setuid-sandbox",
+                            "--disable-dev-shm-usage"
+                        ]
+                    }
+                }
+            )
+            
+            # Optional stealth hook (Crawlee provides good defaults)
+            @crawler.pre_navigation_hook
+            async def pre_navigation_hook(context) -> None:
+                if hasattr(context, 'page') and context.page:
+                    # Minimal stealth - Crawlee handles most anti-bot measures automatically
+                    await context.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            
+            @crawler.router.default_handler
+            async def adaptive_handler(context) -> None:
+                url = context.request.url
+                
+                # Check if URL is PDF and handle text extraction
+                if url.lower().endswith(".pdf"):
+                    doc = await self._handle_pdf_from_context(context)
+                    if doc:
+                        self._add_document_to_batch(doc)
+                    return
+                
+                # Handle regular web pages
+                await self._handle_adaptive_page(context)
+            
+            # Run the crawler with initial URLs
+            await crawler.run(self.initial_urls)
+        
+        # Flag to track when crawling is complete
+        crawl_complete = threading.Event()
+        
+        def run_crawler():
+            """Run the crawler in a separate thread."""
             try:
-                protected_url_check(initial_url)
-            except Exception as e:
-                session_ctx.last_error = f"Invalid URL {initial_url} due to {e}"
-                logger.warning(session_ctx.last_error)
-                continue
-
-            index = len(session_ctx.visited_links)
-            logger.info(f"{index}: Visiting {initial_url}")
-
-            # Add retry mechanism with exponential backoff
-            retry_count = 0
-
-            while retry_count < self.MAX_RETRIES:
-                if retry_count > 0:
-                    # Add a random delay between retries (exponential backoff)
-                    delay = min(2**retry_count + random.uniform(0, 1), 10)
-                    logger.info(
-                        f"Retry {retry_count}/{self.MAX_RETRIES} for {initial_url} after {delay:.2f}s delay"
-                    )
-                    time.sleep(delay)
-
-                try:
-                    result = self._do_scrape(index, initial_url, session_ctx)
-                    if result.retry:
-                        continue
-
-                    if result.doc:
-                        session_ctx.doc_batch.append(result.doc)
-                except Exception as e:
-                    session_ctx.last_error = f"Failed to fetch '{initial_url}': {e}"
-                    logger.exception(session_ctx.last_error)
-                    session_ctx.initialize()
-                    continue
-                finally:
-                    retry_count += 1
-
-                break  # success / don't retry
-
-            if len(session_ctx.doc_batch) >= self.batch_size:
-                session_ctx.initialize()
-                session_ctx.at_least_one_doc = True
-                yield session_ctx.doc_batch
-                session_ctx.doc_batch = []
-
-        if session_ctx.doc_batch:
-            session_ctx.stop()
-            session_ctx.at_least_one_doc = True
-            yield session_ctx.doc_batch
-
-        if not session_ctx.at_least_one_doc:
-            if session_ctx.last_error:
-                raise RuntimeError(session_ctx.last_error)
+                asyncio.run(crawl())
+            finally:
+                crawl_complete.set()
+        
+        # Start crawling in background thread
+        crawler_thread = threading.Thread(target=run_crawler)
+        crawler_thread.start()
+        
+        # Yield batches as they become available during crawling
+        try:
+            while not crawl_complete.is_set() or self._batch_queue:
+                # Check for completed batches
+                batch = self._get_next_batch()
+                if batch:
+                    yield batch
+                else:
+                    # No batch ready, wait briefly if crawling is still active
+                    if not crawl_complete.is_set():
+                        time.sleep(0.1)
+                    elif not self._batch_queue:
+                        # Crawling done and no more batches
+                        break
+        finally:
+            # Ensure crawler thread completes
+            crawler_thread.join()
+        
+        # Finalize any remaining documents and yield final batches
+        self._finalize_batches()
+        
+        # Yield any remaining batches
+        while True:
+            batch = self._get_next_batch()
+            if not batch:
+                break
+            yield batch
+        
+        # Check if we found any documents at all
+        if not self.documents:
             raise RuntimeError("No valid pages found.")
 
-        session_ctx.stop()
-
     def validate_connector_settings(self) -> None:
-        # Make sure we have at least one valid URL to check
-        if not self.to_visit_list:
+        """Validate connector configuration and test connectivity."""
+        # Make sure we have URLs configured
+        if not self.initial_urls:
             raise ConnectorValidationError(
-                "No URL configured. Please provide at least one valid URL."
+                "No URLs configured. Please provide at least one valid URL."
             )
 
         if (
@@ -726,8 +561,8 @@ class WebConnector(LoadConnector):
         ):
             return None
 
-        # We'll just test the first URL for connectivity and correctness
-        test_url = self.to_visit_list[0]
+        # For validation, test the base URL
+        test_url = self.base_url
 
         # Check that the URL is allowed and well-formed
         try:
@@ -740,33 +575,298 @@ class WebConnector(LoadConnector):
             # Typically DNS or other network issues
             raise ConnectorValidationError(str(e))
 
-        # Make a quick request to see if we get a valid response
+        # Make a quick request to see if we get a valid response (let Crawlee handle detailed validation)
         try:
-            check_internet_connection(test_url)
-        except Exception as e:
-            err_str = str(e)
-            if "401" in err_str:
+            response = requests.get(test_url, headers=DEFAULT_HEADERS, timeout=10)
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response else 0
+            if status_code == 401:
                 raise CredentialExpiredError(
                     f"Unauthorized access to '{test_url}': {e}"
                 )
-            elif "403" in err_str:
+            elif status_code == 403:
                 raise InsufficientPermissionsError(
                     f"Forbidden access to '{test_url}': {e}"
                 )
-            elif "404" in err_str:
+            elif status_code == 404:
                 raise ConnectorValidationError(f"Page not found for '{test_url}': {e}")
-            elif "Max retries exceeded" in err_str and "NameResolutionError" in err_str:
+            else:
+                raise UnexpectedValidationError(
+                    f"HTTP error validating '{test_url}': {e}"
+                )
+        except requests.exceptions.RequestException as e:
+            if "NameResolutionError" in str(e):
                 raise ConnectorValidationError(
                     f"Unable to resolve hostname for '{test_url}'. Please check the URL and your internet connection."
                 )
             else:
-                # Could be a 5xx or another error, treat as unexpected
                 raise UnexpectedValidationError(
-                    f"Unexpected error validating '{test_url}': {e}"
+                    f"Network error validating '{test_url}': {e}"
                 )
 
 
 if __name__ == "__main__":
-    connector = WebConnector("https://docs.onyx.app/")
-    document_batches = connector.load_from_state()
-    print(next(document_batches))
+    import argparse
+    import sys
+    
+    parser = argparse.ArgumentParser(
+        description="Adaptive Web Connector - Extract content from websites with automatic JavaScript detection and specialized framework support",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single page extraction
+  python connector.py --url https://example.com --type single
+  
+  # Recursive crawling (automatically detects JS requirements)
+  python connector.py --url https://docs.example.com --type recursive
+  
+  # Sitemap-based crawling
+  python connector.py --url https://example.com/sitemap.xml --type sitemap
+  
+  # Zoomin documentation with custom batch size
+  python connector.py --url https://docs-cybersec.thalesgroup.com/bundle/guide/page/overview.htm --type single --batch-size 5
+  
+  # Save batches for ingestion API
+  python connector.py --url https://docs.example.com --type recursive --save-batches --batch-dir ./ingestion_batches
+        """
+    )
+    
+    parser.add_argument(
+        "--url", "-u",
+        required=True,
+        help="URL to crawl (base URL for recursive, sitemap URL for sitemap, specific page for single)"
+    )
+    
+    parser.add_argument(
+        "--type", "-t",
+        choices=["single", "recursive", "sitemap", "upload"],
+        default="single",
+        help="Crawling type (default: single)"
+    )
+    
+    parser.add_argument(
+        "--batch-size", "-b",
+        type=int,
+        default=INDEX_BATCH_SIZE,
+        help=f"Number of documents per batch (default: {INDEX_BATCH_SIZE})"
+    )
+    
+    
+    parser.add_argument(
+        "--no-mintlify",
+        action="store_true",
+        help="Disable Mintlify-specific cleanup"
+    )
+    
+    parser.add_argument(
+        "--no-specialized",
+        action="store_true",
+        help="Disable specialized extractors (Zoomin, etc.)"
+    )
+    
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+    
+    parser.add_argument(
+        "--output", "-o",
+        help="Output file to save extracted content (JSON format)"
+    )
+    
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=30,
+        help="Request timeout in seconds (default: 30)"
+    )
+    
+    parser.add_argument(
+        "--save-batches",
+        action="store_true",
+        help="Save each batch as a separate JSON file for ingestion API"
+    )
+    
+    parser.add_argument(
+        "--batch-dir",
+        default="./batches",
+        help="Directory to save batch files (default: ./batches)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Configure logging level
+    if args.verbose:
+        import logging
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+    
+    # Configure global timeout for requests
+    NETWORK_TIMEOUT = args.timeout
+    
+    # Setup batch saving if requested
+    if args.save_batches:
+        import os
+        import json
+        from datetime import datetime
+        
+        # Create batch directory
+        os.makedirs(args.batch_dir, exist_ok=True)
+        print(f"Batch files will be saved to: {args.batch_dir}")
+    
+    def save_batch_for_ingestion(batch_docs: list, batch_num: int, source_url: str) -> str:
+        """Save a batch of documents in ingestion API format."""
+        if not args.save_batches:
+            return None
+            
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"batch_{batch_num:03d}_{timestamp}.json"
+        filepath = os.path.join(args.batch_dir, filename)
+        
+        # Convert documents to ingestion API format
+        ingestion_docs = []
+        for doc in batch_docs:
+            # Extract first text section
+            text_content = ""
+            source_link = None
+            if doc.sections:
+                text_content = doc.sections[0].text
+                source_link = doc.sections[0].link
+            
+            # Prepare metadata in the expected format
+            metadata = doc.metadata.copy() if doc.metadata else {}
+            metadata["document_id"] = doc.id
+            metadata["source_url"] = source_url
+            metadata["batch_number"] = batch_num
+            metadata["extraction_timestamp"] = timestamp
+            
+            # Add extractor info if available
+            if "extractor" in metadata:
+                metadata["extraction_method"] = metadata["extractor"]
+            
+            # Create ingestion document
+            ingestion_doc = {
+                "document": {
+                    "id": doc.id,
+                    "sections": [
+                        {
+                            "text": text_content,
+                            "link": source_link or doc.id
+                        }
+                    ],
+                    "source": "web",  # DocumentSource.WEB
+                    "semantic_identifier": doc.semantic_identifier or doc.id,
+                    "metadata": metadata,
+                    "from_ingestion_api": True
+                }
+            }
+            
+            # Add optional fields if present
+            if doc.doc_updated_at:
+                ingestion_doc["document"]["doc_updated_at"] = doc.doc_updated_at.isoformat()
+            
+            ingestion_docs.append(ingestion_doc)
+        
+        # Save to file
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(ingestion_docs, f, indent=2, ensure_ascii=False)
+            return filepath
+        except Exception as e:
+            print(f"Error saving batch {batch_num}: {e}")
+            return None
+    
+    # Create connector with specified parameters
+    try:
+        connector = WebConnectorCrawlee(
+            base_url=args.url,
+            web_connector_type=args.type,
+            mintlify_cleanup=not args.no_mintlify,
+            batch_size=args.batch_size,
+            enable_specialized_extraction=not args.no_specialized,
+        )
+        
+        print(f"Starting {args.type} crawl of: {args.url}")
+        print(f"Adaptive rendering: enabled (automatically detects JS requirements)")
+        print(f"Specialized extraction: {'enabled' if not args.no_specialized else 'disabled'}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Network timeout: {args.timeout}s")
+        print("-" * 60)
+        
+        # Run the connector and collect results
+        all_documents = []
+        batch_count = 0
+        
+        for batch in connector.load_from_state():
+            batch_count += 1
+            batch_size = len(batch)
+            all_documents.extend(batch)
+            
+            print(f"Batch {batch_count}: {batch_size} documents")
+            
+            # Save batch for ingestion API if requested
+            if args.save_batches:
+                saved_file = save_batch_for_ingestion(batch, batch_count, args.url)
+                if saved_file:
+                    print(f"  Saved to: {saved_file}")
+            
+            # Show sample from first batch
+            if batch_count == 1 and batch:
+                sample_doc = batch[0]
+                print(f"  Sample title: {sample_doc.semantic_identifier}")
+                print(f"  Sample content length: {len(sample_doc.sections[0].text) if sample_doc.sections else 0} chars")
+                if hasattr(sample_doc, 'metadata') and sample_doc.metadata:
+                    print(f"  Sample metadata: {list(sample_doc.metadata.keys())}")
+        
+        print("-" * 60)
+        print(f"Crawling complete! Total: {len(all_documents)} documents in {batch_count} batches")
+        
+        if args.save_batches:
+            print(f"Batch files saved to: {args.batch_dir}/")
+            print(f"To ingest via API, POST each batch file to: /onyx-api/ingestion")
+        
+        # Save to file if requested
+        if args.output:
+            import json
+            output_data = []
+            for doc in all_documents:
+                doc_data = {
+                    "id": doc.id,
+                    "title": doc.semantic_identifier,
+                    "content": doc.sections[0].text if doc.sections else "",
+                    "source": doc.source.value if hasattr(doc.source, 'value') else str(doc.source),
+                    "metadata": doc.metadata or {},
+                    "updated_at": doc.doc_updated_at.isoformat() if doc.doc_updated_at else None
+                }
+                output_data.append(doc_data)
+            
+            with open(args.output, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+            print(f"Results saved to: {args.output}")
+        
+        # Show summary of extracted content
+        if all_documents:
+            total_chars = sum(len(doc.sections[0].text) if doc.sections else 0 for doc in all_documents)
+            avg_chars = total_chars // len(all_documents) if all_documents else 0
+            print(f"Content summary: {total_chars:,} total chars, {avg_chars:,} avg per document")
+            
+            # Show extractor usage if specialized extraction was enabled
+            if not args.no_specialized:
+                extractor_used = any(
+                    doc.metadata and doc.metadata.get('extractor') 
+                    for doc in all_documents 
+                    if hasattr(doc, 'metadata')
+                )
+                if extractor_used:
+                    extractors = set(
+                        doc.metadata.get('extractor', 'standard') 
+                        for doc in all_documents 
+                        if hasattr(doc, 'metadata') and doc.metadata
+                    )
+                    print(f"Extractors used: {', '.join(extractors)}")
+    
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)

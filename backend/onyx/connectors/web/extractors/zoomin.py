@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 
 from .base import BaseExtractor, ExtractedContent
 from onyx.utils.logger import setup_logger
-from onyx.file_processing.html_utils import parse_html_with_trafilatura_markdown
+from onyx.file_processing.html_utils import convert_html_to_markdown
 
 logger = setup_logger()
 
@@ -126,9 +126,16 @@ class ZoominExtractor(BaseExtractor):
             logger.error("Could not find Zoomin content container")
             return None
         
-        # Try to extract as Markdown using trafilatura first
+        # Try to extract as Markdown first
         content_html = str(content_element)
-        markdown_content = parse_html_with_trafilatura_markdown(content_html)
+        # Pass Zoomin-specific selectors to remove
+        zoomin_ui_selectors = [
+            '.dataTables_filter', '.dataTables_info', '.dataTables_paginate',
+            '.zDocsFilterTableDiv', '.zDocsTopicPageTableExportButton',
+            '.dropdown-menu', '.searchTableDiv', 'input[type="search"]',
+            'input[type="text"]', 'button', 'svg'
+        ]
+        markdown_content = convert_html_to_markdown(content_html, ui_elements_to_remove=zoomin_ui_selectors)
         
         if markdown_content and len(markdown_content) > 50:
             logger.info(f"Extracted {len(markdown_content)} chars of Markdown content")
