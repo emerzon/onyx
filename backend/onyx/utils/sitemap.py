@@ -15,7 +15,7 @@ def _get_sitemap_locations_from_robots(base_url: str) -> Set[str]:
     sitemap_urls: set = set()
     try:
         robots_url = urljoin(base_url, "/robots.txt")
-        resp = requests.get(robots_url, timeout=10)
+        resp = requests.get(robots_url, timeout=30)
         if resp.status_code == 200:
             for line in resp.text.splitlines():
                 if line.lower().startswith("sitemap:"):
@@ -30,7 +30,7 @@ def _extract_urls_from_sitemap(sitemap_url: str) -> Set[str]:
     """Extract URLs from a sitemap XML file"""
     urls: set[str] = set()
     try:
-        resp = requests.get(sitemap_url, timeout=10)
+        resp = requests.get(sitemap_url, timeout=30)
         if resp.status_code != 200:
             return urls
 

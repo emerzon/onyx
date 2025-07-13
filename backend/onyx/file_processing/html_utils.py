@@ -6,6 +6,7 @@ from typing import IO
 import bs4
 import trafilatura  # type: ignore
 from trafilatura.settings import use_config  # type: ignore
+from markdownify import markdownify
 
 from onyx.configs.app_configs import HTML_BASED_CONNECTOR_TRANSFORM_LINKS_STRATEGY
 from onyx.configs.app_configs import PARSE_WITH_TRAFILATURA
@@ -63,6 +64,50 @@ def parse_html_with_trafilatura(html_content: str) -> str:
 
     extracted_text = trafilatura.extract(html_content, config=config)
     return strip_excessive_newlines_and_spaces(extracted_text) if extracted_text else ""
+
+
+def parse_html_with_trafilatura_markdown(html_content: str) -> str:
+    """Parse HTML content using markdownify for better table handling."""
+    # Clean up the HTML first to remove problematic elements
+    soup = bs4.BeautifulSoup(html_content, "html.parser")
+    
+    # Remove DataTables UI elements that confuse conversion but keep tables
+    ui_selectors = [
+        '.dataTables_filter', '.dataTables_info', '.dataTables_paginate',
+        '.zDocsFilterTableDiv', '.zDocsTopicPageTableExportButton',
+        '.dropdown-menu', '.searchTableDiv', 'input[type="search"]',
+        'input[type="text"]', 'button', 'svg'
+    ]
+    
+    for selector in ui_selectors:
+        for element in soup.select(selector):
+            element.decompose()
+    
+    # Remove search/filter rows from table headers that don't contain real data
+    for tr in soup.select('tr.searchTableDiv'):
+        tr.decompose()
+    
+    # Convert to markdown using markdownify
+    markdown_content = markdownify(
+        str(soup),
+        heading_style="ATX",
+        bullets="-",
+        strip=['script', 'style'],
+        escape_misc=False,
+        escape_asterisks=False,
+        escape_underscores=False
+    )
+    
+    if not markdown_content:
+        return ""
+    
+    # Custom cleanup that preserves markdown table structure
+    # Remove excessive spaces but preserve important newlines for tables
+    markdown_content = re.sub(r" +", " ", markdown_content)  # collapse multiple spaces
+    markdown_content = re.sub(r" +\n", "\n", markdown_content)  # remove trailing spaces before newlines
+    markdown_content = re.sub(r"\n{3,}", "\n\n", markdown_content)  # limit to max 2 consecutive newlines
+    
+    return markdown_content.strip()
 
 
 def format_document_soup(
