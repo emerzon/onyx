@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from crawlee.crawlers import AdaptivePlaywrightCrawler
+from crawlee import ConcurrencySettings
 from oauthlib.oauth2 import BackendApplicationClient
 from requests_oauthlib import OAuth2Session
 
@@ -40,42 +41,13 @@ from shared_configs.configs import MULTI_TENANT
 
 logger = setup_logger()
 
-
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
-        "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Sec-CH-UA": '"Google Chrome";v="123", "Not:A-Brand";v="8"',
-    "Sec-CH-UA-Mobile": "?0",
-    "Sec-CH-UA-Platform": '"macOS"',
-}
-
-
 class WEB_CONNECTOR_VALID_SETTINGS(str, Enum):
     RECURSIVE = "recursive"
     SINGLE = "single"
     SITEMAP = "sitemap"
     UPLOAD = "upload"
 
-
-
-WEB_CONNECTOR_MAX_SCROLL_ATTEMPTS = 20
 IFRAME_TEXT_LENGTH_THRESHOLD = 700
-JAVASCRIPT_DISABLED_MESSAGE = "You have JavaScript disabled in your browser"
-
 
 def protected_url_check(url: str) -> None:
     """Validates that URL points to a globally accessible resource."""
@@ -101,10 +73,6 @@ def protected_url_check(url: str) -> None:
                 f"Non-global IP address detected: {ip}, skipping page {url}. "
                 f"The Web Connector is not allowed to read loopback, link-local, or private ranges"
             )
-
-
-
-
 
 
 def is_valid_url(url: str) -> bool:
@@ -213,7 +181,7 @@ class WebConnectorCrawlee(LoadConnector):
             sitemap_url = self._discover_sitemap_url(sitemap_url)
         
         try:
-            response = requests.get(sitemap_url, headers=DEFAULT_HEADERS, timeout=30)
+            response = requests.get(sitemap_url, timeout=30)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.content, "xml")
@@ -266,7 +234,7 @@ class WebConnectorCrawlee(LoadConnector):
         for path in sitemap_paths:
             sitemap_url = urljoin(base_url, path)
             try:
-                response = requests.head(sitemap_url, headers=DEFAULT_HEADERS, timeout=10)
+                response = requests.head(sitemap_url, timeout=10)
                 if response.status_code == 200:
                     logger.info(f"Found sitemap at: {sitemap_url}")
                     return sitemap_url
@@ -276,7 +244,7 @@ class WebConnectorCrawlee(LoadConnector):
         # If no sitemap found, check robots.txt
         try:
             robots_url = urljoin(base_url, 'robots.txt')
-            response = requests.get(robots_url, headers=DEFAULT_HEADERS, timeout=10)
+            response = requests.get(robots_url, timeout=10)
             if response.status_code == 200:
                 for line in response.text.split('\n'):
                     line = line.strip()
@@ -306,7 +274,7 @@ class WebConnectorCrawlee(LoadConnector):
                 pdf_content = context.response.body
             else:
                 # Fallback: download PDF directly
-                response = requests.get(url, headers=DEFAULT_HEADERS, timeout=30)
+                response = requests.get(url, timeout=30)
                 response.raise_for_status()
                 pdf_content = response.content
             
@@ -473,8 +441,12 @@ class WebConnectorCrawlee(LoadConnector):
                             "--disable-setuid-sandbox",
                             "--disable-dev-shm-usage"
                         ]
-                    }
-                }
+                    }},
+                concurrency_settings=ConcurrencySettings(
+                    max_concurrency=10,
+                    desired_concurrency=5,
+                    min_concurrency=1
+                ),
             )
             
             # Optional stealth hook (Crawlee provides good defaults)
@@ -577,7 +549,7 @@ class WebConnectorCrawlee(LoadConnector):
 
         # Make a quick request to see if we get a valid response (let Crawlee handle detailed validation)
         try:
-            response = requests.get(test_url, headers=DEFAULT_HEADERS, timeout=10)
+            response = requests.get(test_url, timeout=10)
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response else 0
