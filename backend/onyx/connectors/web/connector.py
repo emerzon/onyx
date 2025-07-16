@@ -3,13 +3,16 @@ Web Connector implementation using Crawlee library.
 This module replaces the Playwright-based web scraping with Crawlee's more robust framework.
 """
 
+import fcntl
 import hashlib
 import io
 import ipaddress
 import socket
+import threading
+import time
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, AsyncGenerator, Optional, cast
+from typing import Any, AsyncGenerator, List, Optional, cast
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -173,6 +176,11 @@ class WebConnectorCrawlee(LoadConnector):
         # State tracking
         self.content_hashes: set[str] = set()  # Using stable MD5 hashes for content deduplication
         self.documents: list[Document] = []
+        self.failed_urls: dict[str, dict[str, Any]] = {}  # Map of failed_url -> {error, source_pages}
+        self.link_references: dict[str, set[str]] = {}  # Map of link -> set of source_pages that reference it
+        
+        # Thread synchronization for file access
+        self.file_access_lock = threading.Lock()  # Prevent filesystem contention deadlocks
         
         # Initialize extractor factory for specialized content extraction
         self.enable_specialized_extraction = enable_specialized_extraction
@@ -337,21 +345,21 @@ class WebConnectorCrawlee(LoadConnector):
 
 
 
-    def _extract_content(self, url: str, soup: BeautifulSoup, raw_html: str) -> tuple[str | None, str, dict[str, Any]]:
+    def _extract_content(self, url: str, soup: BeautifulSoup, raw_html: str) -> tuple[str | None, str, dict[str, Any], List[str]]:
         """Extract content using specialized extractors or fallback methods."""
         # Try generic extractor first (if configured)
         if self.selector_resolver:
             generic_extractor = self.selector_resolver.get_extractor(soup, url)
             if generic_extractor:
                 extracted = generic_extractor.extract_content(soup, url)
-                return extracted.title, extracted.content, extracted.metadata or {}
+                return extracted.title, extracted.content, extracted.metadata or {}, extracted.links or []
         
         # Try specialized extractor second
         if self.extractor_factory:
             extractor = self.extractor_factory.get_extractor(soup, url)
             if extractor:
                 extracted = extractor.extract_content(soup, url)
-                return extracted.title, extracted.content, extracted.metadata or {}
+                return extracted.title, extracted.content, extracted.metadata or {}, extracted.links or []
         
         # Fallback to standard extraction
         title = soup.title.string if soup.title else None
@@ -363,7 +371,7 @@ class WebConnectorCrawlee(LoadConnector):
             title = parsed_html.title
             text_content = parsed_html.cleaned_text
         
-        return title, text_content, {}
+        return title, text_content, {}, []
 
 
 
@@ -435,8 +443,8 @@ class WebConnectorCrawlee(LoadConnector):
                             ]
                         }},
                     concurrency_settings=ConcurrencySettings(
-                        max_concurrency=10,
-                        desired_concurrency=5,
+                        max_concurrency=5,  # Reduced from 10 to minimize deadlock risk
+                        desired_concurrency=3,  # Reduced from 5 to minimize deadlock risk
                         min_concurrency=1
                     ),
                 )
@@ -445,10 +453,14 @@ class WebConnectorCrawlee(LoadConnector):
                 from crawlee.crawlers import BeautifulSoupCrawler
                 crawler = BeautifulSoupCrawler(
                     concurrency_settings=ConcurrencySettings(
-                        max_concurrency=10,
-                        desired_concurrency=5,
+                        max_concurrency=5,  # Reduced from 10 to minimize deadlock risk
+                        desired_concurrency=3,  # Reduced from 5 to minimize deadlock risk
                         min_concurrency=1
                     ),
+                    # Configure Crawlee's built-in timeout and error handling
+                    request_handler_timeout=45,  # 45 second timeout per request
+                    max_requests_per_crawl=None,  # No artificial limits
+                    max_request_retries=2,  # Limit retries to prevent infinite loops
                 )
             else:  # dynamic
                 # Use PlaywrightCrawler for dynamic content only
@@ -462,8 +474,8 @@ class WebConnectorCrawlee(LoadConnector):
                         ]
                     },
                     concurrency_settings=ConcurrencySettings(
-                        max_concurrency=10,
-                        desired_concurrency=5,
+                        max_concurrency=5,  # Reduced from 10 to minimize deadlock risk
+                        desired_concurrency=3,  # Reduced from 5 to minimize deadlock risk
                         min_concurrency=1
                     ),
                 )
@@ -541,6 +553,49 @@ class WebConnectorCrawlee(LoadConnector):
                     # Minimal stealth - Crawlee handles most anti-bot measures automatically
                     await context.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
             
+            # Add failure handler to track failed requests
+            async def handle_failed_request(context) -> None:
+                """Handle failed requests and track them."""
+                url = context.request.url
+                logger.info(f"BROKEN_LINK_TRACKER: Processing failed request for {url}")
+                
+                error_info = getattr(context, 'error', None) or getattr(context, 'exception', None)
+                
+                if error_info:
+                    error_msg = str(error_info)
+                    # Extract status code from error message if available
+                    if "status code:" in error_msg:
+                        status_code = error_msg.split("status code:")[1].strip().rstrip(")")
+                        error_reason = f"HTTP {status_code}"
+                    elif "ConnectTimeout" in error_msg:
+                        error_reason = "Connection timeout"
+                    elif "ConnectError" in error_msg:
+                        error_reason = "Connection error"
+                    elif "Network is unreachable" in error_msg:
+                        error_reason = "Network unreachable"
+                    else:
+                        error_reason = error_msg
+                else:
+                    error_reason = "Unknown error"
+                
+                # Get source pages that referenced this failed URL
+                source_pages = list(self.link_references.get(url, set()))
+                
+                # Store failed URL with error reason and source pages
+                self.failed_urls[url] = {
+                    "error": error_reason,
+                    "source_pages": source_pages
+                }
+                
+                logger.warning(f"Failed to process {url}: {error_reason}")
+                if source_pages:
+                    logger.info(f"Referenced by {len(source_pages)} page(s): {', '.join(source_pages[:3])}{'...' if len(source_pages) > 3 else ''}")
+                else:
+                    logger.info(f"No source pages tracked for {url} (may be initial URL or external reference)")
+            
+            # Set the error handler on the crawler
+            crawler.failed_request_handler = handle_failed_request
+            
             # Define the handler based on crawler mode
             if self.crawler_mode == "static":
                 @crawler.router.default_handler
@@ -571,54 +626,72 @@ class WebConnectorCrawlee(LoadConnector):
                 async def dynamic_handler(context) -> None:
                     url = context.request.url
                     
-                    # Check if URL is PDF and handle text extraction
-                    if url.lower().endswith(".pdf"):
-                        doc = await self._handle_pdf_from_context(context)
-                        if doc:
-                            # Store document data in dataset
-                            await dataset.push_data({
-                                'id': doc.id,
-                                'sections': [{'link': s.link, 'text': s.text} for s in doc.sections],
-                                'source': doc.source.value if hasattr(doc.source, 'value') else str(doc.source),
-                                'semantic_identifier': doc.semantic_identifier,
-                                'metadata': doc.metadata,
-                                'doc_updated_at': doc.doc_updated_at.isoformat() if doc.doc_updated_at else None,
-                            })
+                    try:
+                        # Add timeout protection to prevent deadlocks
+                        async with asyncio.timeout(45):  # 45 second timeout to prevent 60s deadlock
+                            # Check if URL is PDF and handle text extraction
+                            if url.lower().endswith(".pdf"):
+                                doc = await self._handle_pdf_from_context(context)
+                                if doc:
+                                    # Store document data in dataset
+                                    await dataset.push_data({
+                                        'id': doc.id,
+                                        'sections': [{'link': s.link, 'text': s.text} for s in doc.sections],
+                                        'source': doc.source.value if hasattr(doc.source, 'value') else str(doc.source),
+                                        'semantic_identifier': doc.semantic_identifier,
+                                        'metadata': doc.metadata,
+                                        'doc_updated_at': doc.doc_updated_at.isoformat() if doc.doc_updated_at else None,
+                                    })
+                                return
+                            
+                            # Check if this is a supported document type that should be stored as base64
+                            if should_store_as_base64(url):
+                                await self._handle_binary_file_with_dataset(context, dataset)
+                            else:
+                                # Handle regular web pages with Playwright
+                                await self._handle_adaptive_page_with_dataset(context, dataset)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Handler timeout for {url} - preventing deadlock")
                         return
-                    
-                    # Check if this is a supported document type that should be stored as base64
-                    if should_store_as_base64(url):
-                        await self._handle_binary_file_with_dataset(context, dataset)
-                    else:
-                        # Handle regular web pages with Playwright
-                        await self._handle_adaptive_page_with_dataset(context, dataset)
+                    except Exception as e:
+                        logger.error(f"Handler error for {url}: {e}")
+                        return
             
             else:  # adaptive
                 @crawler.router.default_handler
                 async def adaptive_handler(context) -> None:
                     url = context.request.url
                     
-                    # Check if URL is PDF and handle text extraction
-                    if url.lower().endswith(".pdf"):
-                        doc = await self._handle_pdf_from_context(context)
-                        if doc:
-                            # Store document data in dataset
-                            await dataset.push_data({
-                                'id': doc.id,
-                                'sections': [{'link': s.link, 'text': s.text} for s in doc.sections],
-                                'source': doc.source.value if hasattr(doc.source, 'value') else str(doc.source),
-                                'semantic_identifier': doc.semantic_identifier,
-                                'metadata': doc.metadata,
-                                'doc_updated_at': doc.doc_updated_at.isoformat() if doc.doc_updated_at else None,
-                            })
+                    try:
+                        # Add timeout protection to prevent deadlocks
+                        async with asyncio.timeout(45):  # 45 second timeout to prevent 60s deadlock
+                            # Check if URL is PDF and handle text extraction
+                            if url.lower().endswith(".pdf"):
+                                doc = await self._handle_pdf_from_context(context)
+                                if doc:
+                                    # Store document data in dataset
+                                    await dataset.push_data({
+                                        'id': doc.id,
+                                        'sections': [{'link': s.link, 'text': s.text} for s in doc.sections],
+                                        'source': doc.source.value if hasattr(doc.source, 'value') else str(doc.source),
+                                        'semantic_identifier': doc.semantic_identifier,
+                                        'metadata': doc.metadata,
+                                        'doc_updated_at': doc.doc_updated_at.isoformat() if doc.doc_updated_at else None,
+                                    })
+                                return
+                            
+                            # Check if this is a supported document type that should be stored as base64
+                            if should_store_as_base64(url):
+                                await self._handle_binary_file_with_dataset(context, dataset)
+                            else:
+                                # Handle regular web pages
+                                await self._handle_adaptive_page_with_dataset(context, dataset)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Handler timeout for {url} - preventing deadlock")
                         return
-                    
-                    # Check if this is a supported document type that should be stored as base64
-                    if should_store_as_base64(url):
-                        await self._handle_binary_file_with_dataset(context, dataset)
-                    else:
-                        # Handle regular web pages
-                        await self._handle_adaptive_page_with_dataset(context, dataset)
+                    except Exception as e:
+                        logger.error(f"Handler error for {url}: {e}")
+                        return
             
             # Run the crawler with initial URLs
             await crawler.run(self.initial_urls)
@@ -671,8 +744,9 @@ class WebConnectorCrawlee(LoadConnector):
                         yield batch_to_yield
                     
                     # If crawling is still active, wait briefly before checking again
+                    # Increased sleep time to reduce filesystem contention and prevent deadlocks
                     if not crawl_complete.is_set():
-                        time.sleep(1.0)  # Check every second for new data
+                        time.sleep(3.0)  # Check every 3 seconds instead of 1 second
                 
                 except KeyboardInterrupt:
                     logger.info("Keyboard interrupt received, starting graceful shutdown...")
@@ -681,7 +755,7 @@ class WebConnectorCrawlee(LoadConnector):
                 except Exception as e:
                     logger.error(f"Error in yielding loop: {e}")
                     # Continue processing despite errors
-                    time.sleep(1.0)
+                    time.sleep(3.0)  # Increased sleep time to reduce contention
             
             # Yield any remaining documents as a final partial batch
             if accumulated_batch:
@@ -704,97 +778,135 @@ class WebConnectorCrawlee(LoadConnector):
         """Check if there are new document files since last check (efficient version)."""
         from pathlib import Path
         
-        dataset_path = self._find_dataset_path(storage_dir)
-        if not dataset_path or not dataset_path.exists():
-            return False
+        # Use file access lock to prevent deadlocks with crawler thread
+        with self.file_access_lock:
+            dataset_path = self._find_dataset_path(storage_dir)
+            if not dataset_path or not dataset_path.exists():
+                return False
+                
+            # Count JSON files (excluding metadata) - more efficient than creating sets
+            current_file_count = len([f for f in dataset_path.glob("*.json") if not f.name.startswith("__")])
             
-        # Count JSON files (excluding metadata) - more efficient than creating sets
-        current_file_count = len([f for f in dataset_path.glob("*.json") if not f.name.startswith("__")])
-        
-        # Check if we have more files than before
-        return current_file_count > last_file_count
+            # Check if we have more files than before
+            return current_file_count > last_file_count
     
     def _get_new_documents(self, storage_dir: str, yielded_files: set, last_file_count: int) -> tuple[list[Document], int]:
         """Get new documents from storage directory, only processing files added since last check."""
         import json
         from pathlib import Path
         
-        dataset_path = self._find_dataset_path(storage_dir)
-        if not dataset_path or not dataset_path.exists():
-            return [], last_file_count
-        
-        # Get all JSON files sorted by name (Crawlee creates them with sequential numbers)
-        all_json_files = sorted([f for f in dataset_path.glob("*.json") if not f.name.startswith("__")])
-        current_file_count = len(all_json_files)
-        
-        # Only process files beyond what we've seen before
-        if current_file_count <= last_file_count:
-            return [], current_file_count
-        
-        # Get only the new files (files beyond the last known count)
-        new_files = all_json_files[last_file_count:]
-        
-        new_documents = []
-        
-        for json_file in new_files:
-            # Skip if already processed (safety check)
-            if json_file.name in yielded_files:
-                continue
-                
-            try:
-                with open(json_file, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                    if not content:
-                        logger.warning(f"Skipping empty JSON file: {json_file}")
-                        yielded_files.add(json_file.name)  # Mark as processed
-                        continue
+        # Use file access lock to prevent deadlocks with crawler thread
+        with self.file_access_lock:
+            dataset_path = self._find_dataset_path(storage_dir)
+            if not dataset_path or not dataset_path.exists():
+                return [], last_file_count
+            
+            # Get all JSON files sorted by name (Crawlee creates them with sequential numbers)
+            all_json_files = sorted([f for f in dataset_path.glob("*.json") if not f.name.startswith("__")])
+            current_file_count = len(all_json_files)
+            
+            # Only process files beyond what we've seen before
+            if current_file_count <= last_file_count:
+                return [], current_file_count
+            
+            # Get only the new files (files beyond the last known count)
+            new_files = all_json_files[last_file_count:]
+            
+            new_documents = []
+            
+            for json_file in new_files:
+                # Skip if already processed (safety check)
+                if json_file.name in yielded_files:
+                    continue
                     
-                    doc_data = json.loads(content)
-                
-                # Check if this is a base64 file that needs processing
-                if doc_data.get('metadata', {}).get('is_base64_file', False):
-                    processed_doc = self._process_base64_file(doc_data)
-                    if processed_doc:
-                        new_documents.append(processed_doc)
-                        self.documents.append(processed_doc)
-                        yielded_files.add(json_file.name)
+                # Retry logic for file operations
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        with open(json_file, 'r', encoding='utf-8') as f:
+                            # Add OS-level file locking to prevent corruption
+                            try:
+                                fcntl.flock(f.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)  # Non-blocking shared lock
+                            except OSError:
+                                # File is being written, retry after brief delay
+                                if attempt < max_retries - 1:
+                                    time.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                                    continue
+                                else:
+                                    logger.warning(f"Could not acquire lock for {json_file}, skipping")
+                                    break
+                            
+                            content = f.read().strip()
+                            if not content:
+                                logger.warning(f"Skipping empty JSON file: {json_file}")
+                                yielded_files.add(json_file.name)  # Mark as processed
+                                break
+                            
+                            doc_data = json.loads(content)
+                            # Lock automatically released when file closes
+                            break
+                    except (IOError, OSError) as e:
+                        if attempt < max_retries - 1:
+                            logger.debug(f"File access error for {json_file}, retrying: {e}")
+                            time.sleep(0.1 * (attempt + 1))
+                            continue
+                        else:
+                            logger.error(f"Failed to read {json_file} after {max_retries} attempts: {e}")
+                            continue
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Invalid JSON in {json_file}: {e}")
+                        yielded_files.add(json_file.name)  # Mark as processed to avoid retry
+                        break
+                else:
+                    # If we exhausted retries, skip this file
                     continue
                 
-                # Validate and reconstruct sections with proper text handling
-                sections = []
-                for s in doc_data['sections']:
-                    text = s.get('text')
-                    if text is None or text == "":
-                        logger.warning(f"Skipping section with None/empty text for document {doc_data['id']}")
+                # Process the successfully read document
+                try:
+                    # Check if this is a base64 file that needs processing
+                    if doc_data.get('metadata', {}).get('is_base64_file', False):
+                        processed_doc = self._process_base64_file(doc_data)
+                        if processed_doc:
+                            new_documents.append(processed_doc)
+                            self.documents.append(processed_doc)
+                            yielded_files.add(json_file.name)
                         continue
-                    sections.append(TextSection(link=s['link'], text=str(text)))
-                
-                # Skip document if no valid sections
-                if not sections:
-                    logger.warning(f"Skipping document {doc_data['id']} - no valid sections with text content")
-                    yielded_files.add(json_file.name)  # Mark as processed to avoid re-processing
-                    continue
-                
-                # Reconstruct Document object from stored data
-                doc = Document(
-                    id=doc_data['id'],
-                    sections=sections,
-                    source=DocumentSource.WEB,
-                    semantic_identifier=doc_data['semantic_identifier'],
-                    metadata=doc_data.get('metadata', {}),
-                    doc_updated_at=datetime.fromisoformat(doc_data['doc_updated_at']) if doc_data.get('doc_updated_at') else None,
-                )
-                
-                new_documents.append(doc)
-                self.documents.append(doc)  # Keep for compatibility
-                yielded_files.add(json_file.name)  # Mark as processed
                     
-            except Exception as e:
-                logger.error(f"Error reading document from {json_file}: {e}")
-                yielded_files.add(json_file.name)  # Mark as processed even if failed
-                continue
-        
-        return new_documents, current_file_count
+                    # Validate and reconstruct sections with proper text handling
+                    sections = []
+                    for s in doc_data['sections']:
+                        text = s.get('text')
+                        if text is None or text == "":
+                            logger.warning(f"Skipping section with None/empty text for document {doc_data['id']}")
+                            continue
+                        sections.append(TextSection(link=s['link'], text=str(text)))
+                    
+                    # Skip document if no valid sections
+                    if not sections:
+                        logger.warning(f"Skipping document {doc_data['id']} - no valid sections with text content")
+                        yielded_files.add(json_file.name)  # Mark as processed to avoid re-processing
+                        continue
+                    
+                    # Reconstruct Document object from stored data
+                    doc = Document(
+                        id=doc_data['id'],
+                        sections=sections,
+                        source=DocumentSource.WEB,
+                        semantic_identifier=doc_data['semantic_identifier'],
+                        metadata=doc_data.get('metadata', {}),
+                        doc_updated_at=datetime.fromisoformat(doc_data['doc_updated_at']) if doc_data.get('doc_updated_at') else None,
+                    )
+                    
+                    new_documents.append(doc)
+                    self.documents.append(doc)  # Keep for compatibility
+                    yielded_files.add(json_file.name)  # Mark as processed
+                        
+                except Exception as e:
+                    logger.error(f"Error processing document from {json_file}: {e}")
+                    yielded_files.add(json_file.name)  # Mark as processed even if failed
+                    continue
+            
+            return new_documents, current_file_count
     
     def _find_dataset_path(self, storage_dir: str):
         """Find the actual dataset path in the storage directory."""
@@ -941,7 +1053,30 @@ class WebConnectorCrawlee(LoadConnector):
                 return
             
             # Extract content using specialized extractors or fallback
-            title, text_content, metadata = self._extract_content(url, soup, raw_html)
+            title, text_content, metadata, extracted_links = self._extract_content(url, soup, raw_html)
+            
+            # Track link references for broken link reporting (thread-safe)
+            if extracted_links:
+                def update_link_references():
+                    for link in extracted_links:
+                        if link not in self.link_references:
+                            self.link_references[link] = set()
+                        self.link_references[link].add(url)
+                
+                # Run in executor to prevent async lock contention
+                import asyncio
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, update_link_references)
+            
+            # Add discovered links for recursive crawling (even if content extraction fails)
+            if self.recursive:
+                # Use extracted links if available, otherwise fall back to Crawlee's automatic discovery
+                if extracted_links:
+                    logger.info(f"Enqueueing {len(extracted_links)} extracted links for {url}")
+                    for link in extracted_links:
+                        await context.add_requests([link])
+                else:
+                    await context.enqueue_links(strategy="same-hostname")
             
             # Validate and sanitize text content
             if text_content is None or text_content == "":
@@ -950,10 +1085,6 @@ class WebConnectorCrawlee(LoadConnector):
             
             # Ensure text content is a string
             text_content = str(text_content)
-            
-            # Add discovered links for recursive crawling (Crawlee handles deduplication)
-            if self.recursive:
-                await context.enqueue_links(strategy="same-hostname")
             
             # Check for duplicate content using stable hash
             content_key = f"{title}:{text_content}"
@@ -1346,6 +1477,22 @@ Examples:
         
         print("-" * 60)
         print(f"Crawling complete! Total: {len(all_documents)} documents in {batch_count} batches")
+        
+        # Report failed URLs with source pages
+        if connector.failed_urls:
+            print(f"\nFailed URLs ({len(connector.failed_urls)}):")
+            for failed_url, failure_info in connector.failed_urls.items():
+                error_reason = failure_info["error"]
+                source_pages = failure_info["source_pages"]
+                
+                print(f"  {error_reason}: {failed_url}")
+                if source_pages:
+                    print(f"    Referenced by {len(source_pages)} page(s):")
+                    for source_page in source_pages:
+                        print(f"      - {source_page}")
+                else:
+                    print(f"    No source pages tracked (may be initial URL or external reference)")
+                print()  # Empty line for readability
         
         if args.save_batches:
             print(f"Batch files saved to: {args.batch_dir}/")

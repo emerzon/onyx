@@ -53,7 +53,6 @@ class GenericWebExtractor(BaseExtractor):
         
         # Add extractor information to metadata
         metadata['extractor'] = f'generic_{self.name}'
-        metadata['extractor_version'] = self.config.version
         metadata['selector_config'] = self.config.name
         
         return ExtractedContent(
@@ -237,34 +236,47 @@ class GenericWebExtractor(BaseExtractor):
         base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
         found_links = set()
         
-        # Primary links selector
+        # Always use a comprehensive approach to find all links on the page
+        # Primary links selector (if configured)
         if self.config.navigation.links:
             links = soup.select(self.config.navigation.links)
             for link in links:
                 href = link.get('href')
                 if href:
                     absolute_url = urljoin(url, href)
-                    # Only include links from same domain
-                    if absolute_url.startswith(base_url):
-                        found_links.add(absolute_url)
+                    cleaned_url = self._clean_url(absolute_url)
+                    # Only include valid links from same domain
+                    if cleaned_url and cleaned_url.startswith(base_url):
+                        found_links.add(cleaned_url)
         
-        # Fallback links selectors
-        if not found_links:
-            for selector in self.config.navigation.links_fallback:
-                links = soup.select(selector)
-                for link in links:
-                    href = link.get('href')
-                    if href:
-                        absolute_url = urljoin(url, href)
-                        if absolute_url.startswith(base_url):
-                            found_links.add(absolute_url)
-                
-                # Break if we found links with this fallback
-                if found_links:
-                    logger.debug(f"Used fallback links selector: {selector}")
-                    break
+        # Always check fallback selectors to ensure comprehensive link discovery
+        for selector in self.config.navigation.links_fallback:
+            links = soup.select(selector)
+            for link in links:
+                href = link.get('href')
+                if href:
+                    absolute_url = urljoin(url, href)
+                    cleaned_url = self._clean_url(absolute_url)
+                    if cleaned_url and cleaned_url.startswith(base_url):
+                        found_links.add(cleaned_url)
         
+        logger.debug(f"Found {len(found_links)} links on page")
         return list(found_links)
+    
+    def _clean_url(self, url: str) -> Optional[str]:
+        """Clean URLs by removing anchors/fragments."""
+        if not url:
+            return None
+            
+        # Remove fragments (anchors)
+        if '#' in url:
+            url = url.split('#')[0]
+            
+        # Skip if URL is now empty after removing fragment
+        if not url:
+            return None
+            
+        return url
     
     def _clean_content(self, content: str) -> str:
         """Clean extracted content."""

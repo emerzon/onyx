@@ -51,7 +51,7 @@ class NavigationSelectors:
     
     # Default navigation selectors
     links_fallback: List[str] = field(default_factory=lambda: [
-        'a[href]', 'nav a', '.navigation a', '.menu a'
+        'a[href]'  # This should find all links on the page
     ])
     pagination_fallback: List[str] = field(default_factory=lambda: [
         '.pagination a', '.pager a', '.page-numbers a'
@@ -365,8 +365,7 @@ class SelectorConfig:
             },
             'detection': {
                 'required': self.detection.required,
-                'optional': self.detection.optional,
-                'url_patterns': self.detection.url_patterns
+                'optional': self.detection.optional
             },
             'exclusion': {
                 'remove': self.exclusion.remove,
