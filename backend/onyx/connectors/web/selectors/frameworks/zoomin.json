@@ -1,0 +1,29 @@
+{
+  "name": "zoomin",
+  "detection": ["#zDocsContent"],
+  "title": [
+    "#zDocsContent header h1",
+    "h1.zDocsTitle",
+    ".zDocsContent h1",
+    ".content-title",
+    "h1"
+  ],
+  "body": [
+    ".zDocsTopicPageBodyContent",
+    "article.zDocsContent",
+    ".zDocsTopicPageBody",
+    "#zDocsContent > div.zDocsTopicPageBody",
+    "main#content",
+    "article.bodytext"
+  ],
+  "metadata": {
+    "date": "meta[name='lastMod']",
+    "author": "meta[name='author']"
+  },
+  "exclude": [
+    ".feedback",
+    ".page-actions",
+    "button",
+    "input"
+  ]
+}

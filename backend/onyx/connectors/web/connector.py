@@ -112,12 +112,20 @@ class WebConnectorCrawlee(LoadConnector):
         mintlify_cleanup: bool = True,
         batch_size: int = INDEX_BATCH_SIZE,
         enable_specialized_extraction: bool = True,
+        crawler_mode: str = "adaptive",
+        skip_images: bool = False,
+        selector_config: Optional[str] = None,
+        selector_config_file: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         self.base_url = base_url if "://" in base_url else f"https://{base_url}"
         self.mintlify_cleanup = mintlify_cleanup
         self.batch_size = batch_size
         self.web_connector_type = web_connector_type
+        self.crawler_mode = crawler_mode
+        self.skip_images = skip_images
+        self.selector_config = selector_config
+        self.selector_config_file = selector_config_file
         
         # Initialize URLs based on connector type
         if web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.RECURSIVE.value:
@@ -170,9 +178,38 @@ class WebConnectorCrawlee(LoadConnector):
         self.enable_specialized_extraction = enable_specialized_extraction
         self.extractor_factory = ExtractorFactory() if enable_specialized_extraction else None
         
-        # Incremental batching support
-        self._batch_queue: list[list[Document]] = []
-        self._current_batch: list[Document] = []
+        # Initialize selector resolver for generic extraction (always initialize to use framework configs)
+        from onyx.connectors.web.selectors import SelectorResolver
+        self.selector_resolver = SelectorResolver()
+        if selector_config or selector_config_file:
+            self._setup_selector_resolver()
+
+    def _setup_selector_resolver(self) -> None:
+        """Setup the selector resolver with custom configurations."""
+        from onyx.connectors.web.selectors import SelectorConfig
+        
+        # Load configuration from file if provided
+        if self.selector_config_file:
+            try:
+                custom_config = SelectorConfig.from_file(self.selector_config_file)
+                self.selector_resolver.register_custom_config(custom_config)
+                logger.info(f"Loaded selector config from file: {self.selector_config_file}")
+            except Exception as e:
+                logger.error(f"Failed to load selector config from {self.selector_config_file}: {e}")
+        
+        # Load configuration from JSON/YAML string if provided
+        if self.selector_config:
+            try:
+                # Try JSON first, then YAML
+                try:
+                    custom_config = SelectorConfig.from_json(self.selector_config)
+                except ValueError:
+                    custom_config = SelectorConfig.from_yaml(self.selector_config)
+                
+                self.selector_resolver.register_custom_config(custom_config)
+                logger.info("Loaded selector config from parameter")
+            except Exception as e:
+                logger.error(f"Failed to parse selector config: {e}")
 
     def _extract_sitemap_urls(self, sitemap_url: str) -> list[str]:
         """Extract URLs from a sitemap using simple BeautifulSoup parsing."""
@@ -298,35 +335,18 @@ class WebConnectorCrawlee(LoadConnector):
             logger.error(f"Failed to process PDF {url}: {e}")
             return None
 
-    def _add_document_to_batch(self, doc: Document) -> None:
-        """Add document to current batch and queue completed batches."""
-        self._current_batch.append(doc)
-        self.documents.append(doc)  # Keep for compatibility and final processing
-        
-        # Check if we've reached batch size
-        if len(self._current_batch) >= self.batch_size:
-            # Queue the completed batch
-            self._batch_queue.append(self._current_batch.copy())
-            logger.info(f"Queued batch of {len(self._current_batch)} documents")
-            self._current_batch.clear()
-    
-    def _get_next_batch(self) -> Optional[list[Document]]:
-        """Get the next available batch from the queue."""
-        if self._batch_queue:
-            return self._batch_queue.pop(0)
-        return None
-    
-    def _finalize_batches(self) -> None:
-        """Add any remaining documents as a final batch."""
-        if self._current_batch:
-            self._batch_queue.append(self._current_batch.copy())
-            logger.info(f"Queued final batch of {len(self._current_batch)} documents")
-            self._current_batch.clear()
 
 
     def _extract_content(self, url: str, soup: BeautifulSoup, raw_html: str) -> tuple[str | None, str, dict[str, Any]]:
         """Extract content using specialized extractors or fallback methods."""
-        # Try specialized extractor first
+        # Try generic extractor first (if configured)
+        if self.selector_resolver:
+            generic_extractor = self.selector_resolver.get_extractor(soup, url)
+            if generic_extractor:
+                extracted = generic_extractor.extract_content(soup, url)
+                return extracted.title, extracted.content, extracted.metadata or {}
+        
+        # Try specialized extractor second
         if self.extractor_factory:
             extractor = self.extractor_factory.get_extractor(soup, url)
             if extractor:
@@ -345,60 +365,6 @@ class WebConnectorCrawlee(LoadConnector):
         
         return title, text_content, {}
 
-    async def _handle_adaptive_page(self, context) -> None:
-        """Handle page processing with AdaptivePlaywrightCrawler."""
-        url = context.request.url
-        
-        try:
-            # Validate URL
-            protected_url_check(url)
-            
-            # Get content from adaptive context (Crawlee handles Playwright vs static automatically)
-            if hasattr(context, 'page') and context.page is not None:
-                logger.info(f"Processing with Playwright: {url}")
-                raw_html = await context.page.content()
-                soup = BeautifulSoup(raw_html, "html.parser")
-            elif hasattr(context, 'soup') and context.soup is not None:
-                logger.info(f"Processing with static parser: {url}")
-                soup = context.soup
-                raw_html = str(soup)
-            else:
-                logger.warning(f"No page or soup available for {url}")
-                return
-            
-            # Extract content using specialized extractors or fallback
-            title, text_content, metadata = self._extract_content(url, soup, raw_html)
-            
-            # Add discovered links for recursive crawling (Crawlee handles deduplication)
-            if self.recursive:
-                await context.enqueue_links(strategy="same-hostname")
-            
-            # Check for duplicate content using stable hash
-            content_key = f"{title}:{text_content}"
-            content_hash = hashlib.md5(content_key.encode("utf-8")).hexdigest()
-            
-            if content_hash in self.content_hashes:
-                logger.info(f"Skipping duplicate content for {url}")
-                return
-            
-            self.content_hashes.add(content_hash)
-            
-            # Create and batch document
-            last_modified = getattr(context.response, 'headers', {}).get("Last-Modified") if hasattr(context, 'response') else None
-            
-            doc = Document(
-                id=url,
-                sections=[TextSection(link=url, text=text_content)],
-                source=DocumentSource.WEB,
-                semantic_identifier=title or url,
-                metadata=metadata,
-                doc_updated_at=_get_datetime_from_last_modified_header(last_modified) if last_modified else None,
-            )
-            
-            self._add_document_to_batch(doc)
-            
-        except Exception as e:
-            logger.error(f"Error processing {url}: {e}")
 
 
     async def _extract_iframe_content(self, page: Any, parsed_html: Any) -> None:
@@ -427,27 +393,146 @@ class WebConnectorCrawlee(LoadConnector):
     def load_from_state(self) -> GenerateDocumentsOutput:
         """Main entry point for document generation using Crawlee with incremental batching."""
         import asyncio
+        from crawlee.storages import Dataset
+        import tempfile
+        import shutil
         import threading
         import time
         
+        # Create a unique storage directory for this run
+        storage_dir = tempfile.mkdtemp(prefix="crawlee_storage_")
+        
+        # Track yielded documents to avoid duplicates
+        yielded_files = set()
+        crawl_complete = threading.Event()
+        shutdown_requested = threading.Event()
+        # Accumulate documents for proper batching
+        accumulated_batch = []
+        # Track last yield time for time-based yielding
+        last_yield_time = time.time()
+        # Track last known file count for efficient new file discovery
+        last_file_count = 0
+        
         async def crawl() -> None:
-            # Use AdaptivePlaywrightCrawler with BeautifulSoup static parser
-            # This automatically determines when to use JavaScript vs static parsing
-            crawler = AdaptivePlaywrightCrawler.with_beautifulsoup_static_parser(
-                playwright_crawler_specific_kwargs={
-                    "browser_launch_options": {
+            # Set storage directory using environment variable
+            import os
+            os.environ['CRAWLEE_STORAGE_DIR'] = storage_dir
+            
+            # Open the dataset for storing results
+            dataset = await Dataset.open(name='results')
+            
+            # Create crawler based on mode
+            if self.crawler_mode == "adaptive":
+                # Use AdaptivePlaywrightCrawler with BeautifulSoup static parser
+                # This automatically determines when to use JavaScript vs static parsing
+                crawler = AdaptivePlaywrightCrawler.with_beautifulsoup_static_parser(
+                    playwright_crawler_specific_kwargs={
+                        "browser_launch_options": {
+                            "args": [
+                                "--no-sandbox", 
+                                "--disable-setuid-sandbox",
+                                "--disable-dev-shm-usage"
+                            ]
+                        }},
+                    concurrency_settings=ConcurrencySettings(
+                        max_concurrency=10,
+                        desired_concurrency=5,
+                        min_concurrency=1
+                    ),
+                )
+            elif self.crawler_mode == "static":
+                # Use BeautifulSoupCrawler for static content only
+                from crawlee.crawlers import BeautifulSoupCrawler
+                crawler = BeautifulSoupCrawler(
+                    concurrency_settings=ConcurrencySettings(
+                        max_concurrency=10,
+                        desired_concurrency=5,
+                        min_concurrency=1
+                    ),
+                )
+            else:  # dynamic
+                # Use PlaywrightCrawler for dynamic content only
+                from crawlee.crawlers import PlaywrightCrawler
+                crawler = PlaywrightCrawler(
+                    browser_launch_options={
                         "args": [
                             "--no-sandbox", 
                             "--disable-setuid-sandbox",
                             "--disable-dev-shm-usage"
                         ]
-                    }},
-                concurrency_settings=ConcurrencySettings(
-                    max_concurrency=10,
-                    desired_concurrency=5,
-                    min_concurrency=1
-                ),
-            )
+                    },
+                    concurrency_settings=ConcurrencySettings(
+                        max_concurrency=10,
+                        desired_concurrency=5,
+                        min_concurrency=1
+                    ),
+                )
+            
+            # Helper functions for file type detection
+            def is_supported_document_type(url: str) -> bool:
+                """Check if URL points to a supported document type that can be processed."""
+                supported_extensions = {'.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'}
+                url_lower = url.lower()
+                return any(url_lower.endswith(ext) for ext in supported_extensions)
+            
+            def should_store_as_base64(url: str) -> bool:
+                """Check if URL should be stored as base64 for later processing."""
+                return is_supported_document_type(url)
+            
+            # URL filtering to skip non-HTTP URLs and binary files
+            def should_skip_url(url: str) -> bool:
+                """Check if URL should be skipped based on scheme or file extension."""
+                if not url.startswith(('http://', 'https://')):
+                    return True
+                if any(url.startswith(prefix) for prefix in ['mailto:', 'tel:', 'javascript:', 'data:']):
+                    return True
+                
+                url_lower = url.lower()
+                
+                # Skip images if requested
+                if self.skip_images:
+                    image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.ico', '.svg', '.webp'}
+                    if any(url_lower.endswith(ext) for ext in image_extensions):
+                        return True
+                
+                # Skip truly unsupported binary file extensions
+                # Note: PDF, DOCX, XLS, PPT will be handled as base64 and processed during yielding
+                unsupported_extensions = {
+                    # Archives (would need special handling)
+                    '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2',
+                    # Videos (no text content)
+                    '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm',
+                    # Audio (no text content)
+                    '.mp3', '.wav', '.flac', '.ogg', '.m4a',
+                    # Executables (no text content)
+                    '.exe', '.msi', '.deb', '.rpm', '.dmg',
+                    # Other binary (no text content)
+                    '.bin', '.iso', '.img'
+                }
+                
+                # Always skip these unsupported extensions
+                if any(url_lower.endswith(ext) for ext in unsupported_extensions):
+                    return True
+                
+                # If skip_images is False, images will be processed (but not extracted as text)
+                if not self.skip_images:
+                    image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.ico', '.svg', '.webp'}
+                    if any(url_lower.endswith(ext) for ext in image_extensions):
+                        # Images will be downloaded but not processed for text content
+                        return False
+                        
+                return False
+            
+            # Override the request handler to filter URLs
+            original_run_request_handler = crawler._run_request_handler
+            
+            async def filtered_run_request_handler(context):
+                if should_skip_url(context.request.url):
+                    logger.debug(f"Skipping non-HTTP/binary URL: {context.request.url}")
+                    return
+                return await original_run_request_handler(context)
+            
+            crawler._run_request_handler = filtered_run_request_handler
             
             # Optional stealth hook (Crawlee provides good defaults)
             @crawler.pre_navigation_hook
@@ -456,30 +541,95 @@ class WebConnectorCrawlee(LoadConnector):
                     # Minimal stealth - Crawlee handles most anti-bot measures automatically
                     await context.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
             
-            @crawler.router.default_handler
-            async def adaptive_handler(context) -> None:
-                url = context.request.url
-                
-                # Check if URL is PDF and handle text extraction
-                if url.lower().endswith(".pdf"):
-                    doc = await self._handle_pdf_from_context(context)
-                    if doc:
-                        self._add_document_to_batch(doc)
-                    return
-                
-                # Handle regular web pages
-                await self._handle_adaptive_page(context)
+            # Define the handler based on crawler mode
+            if self.crawler_mode == "static":
+                @crawler.router.default_handler
+                async def static_handler(context) -> None:
+                    url = context.request.url
+                    
+                    # Check if URL is PDF - static crawler can't handle PDFs properly
+                    if url.lower().endswith(".pdf"):
+                        logger.warning(f"Skipping PDF {url} in static mode - use adaptive or dynamic mode for PDFs")
+                        return
+                    
+                    # Check content type if available
+                    if hasattr(context, 'response') and context.response:
+                        content_type = context.response.headers.get('content-type', '').lower()
+                        if any(ct in content_type for ct in ['image/', 'video/', 'audio/', 'application/octet-stream']):
+                            logger.debug(f"Skipping binary content type {content_type} for {url}")
+                            return
+                    
+                    # Check if this is a supported document type that should be stored as base64
+                    if should_store_as_base64(url):
+                        await self._handle_binary_file_with_dataset(context, dataset)
+                    else:
+                        # Handle regular web pages with BeautifulSoup
+                        await self._handle_adaptive_page_with_dataset(context, dataset)
+            
+            elif self.crawler_mode == "dynamic":
+                @crawler.router.default_handler
+                async def dynamic_handler(context) -> None:
+                    url = context.request.url
+                    
+                    # Check if URL is PDF and handle text extraction
+                    if url.lower().endswith(".pdf"):
+                        doc = await self._handle_pdf_from_context(context)
+                        if doc:
+                            # Store document data in dataset
+                            await dataset.push_data({
+                                'id': doc.id,
+                                'sections': [{'link': s.link, 'text': s.text} for s in doc.sections],
+                                'source': doc.source.value if hasattr(doc.source, 'value') else str(doc.source),
+                                'semantic_identifier': doc.semantic_identifier,
+                                'metadata': doc.metadata,
+                                'doc_updated_at': doc.doc_updated_at.isoformat() if doc.doc_updated_at else None,
+                            })
+                        return
+                    
+                    # Check if this is a supported document type that should be stored as base64
+                    if should_store_as_base64(url):
+                        await self._handle_binary_file_with_dataset(context, dataset)
+                    else:
+                        # Handle regular web pages with Playwright
+                        await self._handle_adaptive_page_with_dataset(context, dataset)
+            
+            else:  # adaptive
+                @crawler.router.default_handler
+                async def adaptive_handler(context) -> None:
+                    url = context.request.url
+                    
+                    # Check if URL is PDF and handle text extraction
+                    if url.lower().endswith(".pdf"):
+                        doc = await self._handle_pdf_from_context(context)
+                        if doc:
+                            # Store document data in dataset
+                            await dataset.push_data({
+                                'id': doc.id,
+                                'sections': [{'link': s.link, 'text': s.text} for s in doc.sections],
+                                'source': doc.source.value if hasattr(doc.source, 'value') else str(doc.source),
+                                'semantic_identifier': doc.semantic_identifier,
+                                'metadata': doc.metadata,
+                                'doc_updated_at': doc.doc_updated_at.isoformat() if doc.doc_updated_at else None,
+                            })
+                        return
+                    
+                    # Check if this is a supported document type that should be stored as base64
+                    if should_store_as_base64(url):
+                        await self._handle_binary_file_with_dataset(context, dataset)
+                    else:
+                        # Handle regular web pages
+                        await self._handle_adaptive_page_with_dataset(context, dataset)
             
             # Run the crawler with initial URLs
             await crawler.run(self.initial_urls)
-        
-        # Flag to track when crawling is complete
-        crawl_complete = threading.Event()
         
         def run_crawler():
             """Run the crawler in a separate thread."""
             try:
                 asyncio.run(crawl())
+            except Exception as e:
+                logger.error(f"Crawler thread encountered error: {e}")
+                # Don't re-raise to prevent thread from hanging
             finally:
                 crawl_complete.set()
         
@@ -487,37 +637,350 @@ class WebConnectorCrawlee(LoadConnector):
         crawler_thread = threading.Thread(target=run_crawler)
         crawler_thread.start()
         
-        # Yield batches as they become available during crawling
+        # Yield batches incrementally as they become available
         try:
-            while not crawl_complete.is_set() or self._batch_queue:
-                # Check for completed batches
-                batch = self._get_next_batch()
-                if batch:
-                    yield batch
-                else:
-                    # No batch ready, wait briefly if crawling is still active
+            while not crawl_complete.is_set() or self._has_new_data(storage_dir, last_file_count):
+                try:
+                    # Check for new data and accumulate into batch
+                    new_docs, last_file_count = self._get_new_documents(storage_dir, yielded_files, last_file_count)
+                    accumulated_batch.extend(new_docs)
+                    
+                    current_time = time.time()
+                    time_since_last_yield = current_time - last_yield_time
+                    
+                    # Yield conditions:
+                    # 1. When we have enough documents for a full batch
+                    # 2. When 60 seconds have passed and we have at least 1 document
+                    should_yield_full_batch = len(accumulated_batch) >= self.batch_size
+                    should_yield_time_based = time_since_last_yield >= 60.0 and len(accumulated_batch) >= 1
+                    
+                    if should_yield_full_batch:
+                        # Yield full batches when we have enough documents
+                        while len(accumulated_batch) >= self.batch_size:
+                            batch_to_yield = accumulated_batch[:self.batch_size]
+                            accumulated_batch = accumulated_batch[self.batch_size:]
+                            last_yield_time = time.time()
+                            logger.info(f"Yielding incremental batch of {len(batch_to_yield)} documents (batch size reached)")
+                            yield batch_to_yield
+                    elif should_yield_time_based:
+                        # Yield partial batch after 60 seconds if we have documents
+                        batch_to_yield = accumulated_batch[:]
+                        accumulated_batch = []
+                        last_yield_time = time.time()
+                        logger.info(f"Yielding time-based batch of {len(batch_to_yield)} documents (60s timeout)")
+                        yield batch_to_yield
+                    
+                    # If crawling is still active, wait briefly before checking again
                     if not crawl_complete.is_set():
-                        time.sleep(0.1)
-                    elif not self._batch_queue:
-                        # Crawling done and no more batches
-                        break
+                        time.sleep(1.0)  # Check every second for new data
+                
+                except KeyboardInterrupt:
+                    logger.info("Keyboard interrupt received, starting graceful shutdown...")
+                    shutdown_requested.set()
+                    break
+                except Exception as e:
+                    logger.error(f"Error in yielding loop: {e}")
+                    # Continue processing despite errors
+                    time.sleep(1.0)
+            
+            # Yield any remaining documents as a final partial batch
+            if accumulated_batch:
+                logger.info(f"Yielding final partial batch of {len(accumulated_batch)} documents")
+                yield accumulated_batch
+                    
         finally:
-            # Ensure crawler thread completes
-            crawler_thread.join()
+            # Ensure crawler thread completes with timeout to prevent deadlocks
+            logger.info("Waiting for crawler thread to complete...")
+            crawler_thread.join(timeout=30.0)  # 30 second timeout
+            if crawler_thread.is_alive():
+                logger.warning("Crawler thread did not complete within timeout, proceeding with cleanup")
+            else:
+                logger.info("Crawler thread completed successfully")
+            
+            # Clean up storage directory
+            shutil.rmtree(storage_dir, ignore_errors=True)
+    
+    def _has_new_data(self, storage_dir: str, last_file_count: int) -> bool:
+        """Check if there are new document files since last check (efficient version)."""
+        from pathlib import Path
         
-        # Finalize any remaining documents and yield final batches
-        self._finalize_batches()
+        dataset_path = self._find_dataset_path(storage_dir)
+        if not dataset_path or not dataset_path.exists():
+            return False
+            
+        # Count JSON files (excluding metadata) - more efficient than creating sets
+        current_file_count = len([f for f in dataset_path.glob("*.json") if not f.name.startswith("__")])
         
-        # Yield any remaining batches
-        while True:
-            batch = self._get_next_batch()
-            if not batch:
-                break
-            yield batch
+        # Check if we have more files than before
+        return current_file_count > last_file_count
+    
+    def _get_new_documents(self, storage_dir: str, yielded_files: set, last_file_count: int) -> tuple[list[Document], int]:
+        """Get new documents from storage directory, only processing files added since last check."""
+        import json
+        from pathlib import Path
         
-        # Check if we found any documents at all
-        if not self.documents:
-            raise RuntimeError("No valid pages found.")
+        dataset_path = self._find_dataset_path(storage_dir)
+        if not dataset_path or not dataset_path.exists():
+            return [], last_file_count
+        
+        # Get all JSON files sorted by name (Crawlee creates them with sequential numbers)
+        all_json_files = sorted([f for f in dataset_path.glob("*.json") if not f.name.startswith("__")])
+        current_file_count = len(all_json_files)
+        
+        # Only process files beyond what we've seen before
+        if current_file_count <= last_file_count:
+            return [], current_file_count
+        
+        # Get only the new files (files beyond the last known count)
+        new_files = all_json_files[last_file_count:]
+        
+        new_documents = []
+        
+        for json_file in new_files:
+            # Skip if already processed (safety check)
+            if json_file.name in yielded_files:
+                continue
+                
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if not content:
+                        logger.warning(f"Skipping empty JSON file: {json_file}")
+                        yielded_files.add(json_file.name)  # Mark as processed
+                        continue
+                    
+                    doc_data = json.loads(content)
+                
+                # Check if this is a base64 file that needs processing
+                if doc_data.get('metadata', {}).get('is_base64_file', False):
+                    processed_doc = self._process_base64_file(doc_data)
+                    if processed_doc:
+                        new_documents.append(processed_doc)
+                        self.documents.append(processed_doc)
+                        yielded_files.add(json_file.name)
+                    continue
+                
+                # Validate and reconstruct sections with proper text handling
+                sections = []
+                for s in doc_data['sections']:
+                    text = s.get('text')
+                    if text is None or text == "":
+                        logger.warning(f"Skipping section with None/empty text for document {doc_data['id']}")
+                        continue
+                    sections.append(TextSection(link=s['link'], text=str(text)))
+                
+                # Skip document if no valid sections
+                if not sections:
+                    logger.warning(f"Skipping document {doc_data['id']} - no valid sections with text content")
+                    yielded_files.add(json_file.name)  # Mark as processed to avoid re-processing
+                    continue
+                
+                # Reconstruct Document object from stored data
+                doc = Document(
+                    id=doc_data['id'],
+                    sections=sections,
+                    source=DocumentSource.WEB,
+                    semantic_identifier=doc_data['semantic_identifier'],
+                    metadata=doc_data.get('metadata', {}),
+                    doc_updated_at=datetime.fromisoformat(doc_data['doc_updated_at']) if doc_data.get('doc_updated_at') else None,
+                )
+                
+                new_documents.append(doc)
+                self.documents.append(doc)  # Keep for compatibility
+                yielded_files.add(json_file.name)  # Mark as processed
+                    
+            except Exception as e:
+                logger.error(f"Error reading document from {json_file}: {e}")
+                yielded_files.add(json_file.name)  # Mark as processed even if failed
+                continue
+        
+        return new_documents, current_file_count
+    
+    def _find_dataset_path(self, storage_dir: str):
+        """Find the actual dataset path in the storage directory."""
+        from pathlib import Path
+        
+        # Try the named dataset first
+        dataset_path = Path(storage_dir) / "datasets" / "results"
+        if dataset_path.exists():
+            return dataset_path
+            
+        # Check if datasets directory exists but with different name (e.g., default)
+        datasets_dir = Path(storage_dir) / "datasets"
+        if datasets_dir.exists():
+            available_datasets = list(datasets_dir.glob("*"))
+            # Check the default dataset first
+            default_dataset_path = datasets_dir / "default"
+            if default_dataset_path.exists():
+                return default_dataset_path
+            else:
+                # Use the first available dataset
+                if available_datasets:
+                    return available_datasets[0]
+        
+        return None
+    
+    async def _handle_binary_file_with_dataset(self, context, dataset) -> None:
+        """Handle binary file by storing as base64 for later processing."""
+        import base64
+        import httpx
+        
+        url = context.request.url
+        
+        try:
+            # Download the file content
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                
+                # Encode as base64
+                base64_content = base64.b64encode(response.content).decode('utf-8')
+                
+                # Store with special metadata to indicate it's base64
+                await dataset.push_data({
+                    'id': url,
+                    'sections': [{'link': url, 'text': base64_content}],
+                    'source': 'web',
+                    'semantic_identifier': url,
+                    'metadata': {
+                        'is_base64_file': True,
+                        'content_type': response.headers.get('content-type', ''),
+                        'file_size': len(response.content)
+                    },
+                    'doc_updated_at': None,
+                })
+                
+                logger.info(f"Stored binary file as base64: {url}")
+                
+        except Exception as e:
+            logger.error(f"Error handling binary file {url}: {e}")
+
+    def _process_base64_file(self, doc_data: dict) -> Optional[Document]:
+        """Process a base64 file and convert to text using existing file processors."""
+        import base64
+        import tempfile
+        import os
+        from onyx.file_processing.extract_file_text import extract_file_text
+        
+        url = doc_data['id']
+        base64_content = doc_data['sections'][0]['text']
+        
+        try:
+            # Decode base64 content
+            file_content = base64.b64decode(base64_content)
+            
+            # Determine file extension from URL
+            file_extension = None
+            for ext in ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx']:
+                if url.lower().endswith(ext):
+                    file_extension = ext
+                    break
+            
+            if not file_extension:
+                logger.warning(f"Could not determine file extension for {url}")
+                return None
+            
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(suffix=file_extension, delete=False) as tmp_file:
+                tmp_file.write(file_content)
+                tmp_file_path = tmp_file.name
+            
+            try:
+                # Extract text using existing file processing
+                text_content = extract_file_text(tmp_file_path)
+                
+                if not text_content or text_content.strip() == "":
+                    logger.warning(f"No text content extracted from {url}")
+                    return None
+                
+                # Create document with extracted text
+                doc = Document(
+                    id=url,
+                    sections=[TextSection(link=url, text=text_content.strip())],
+                    source=DocumentSource.WEB,
+                    semantic_identifier=url,
+                    metadata={
+                        'extracted_from_file': True,
+                        'original_content_type': doc_data.get('metadata', {}).get('content_type', ''),
+                        'file_size': doc_data.get('metadata', {}).get('file_size', 0)
+                    },
+                    doc_updated_at=None,
+                )
+                
+                logger.info(f"Successfully processed {file_extension} file: {url}")
+                return doc
+                
+            finally:
+                # Clean up temporary file
+                if os.path.exists(tmp_file_path):
+                    os.unlink(tmp_file_path)
+                    
+        except Exception as e:
+            logger.error(f"Error processing base64 file {url}: {e}")
+            return None
+
+    async def _handle_adaptive_page_with_dataset(self, context, dataset) -> None:
+        """Handle page processing and store results in dataset."""
+        url = context.request.url
+        
+        try:
+            # Validate URL
+            protected_url_check(url)
+            
+            # Get content from adaptive context (Crawlee handles Playwright vs static automatically)
+            if hasattr(context, 'page') and context.page is not None:
+                logger.info(f"Processing with Playwright: {url}")
+                raw_html = await context.page.content()
+                soup = BeautifulSoup(raw_html, "html.parser")
+            elif hasattr(context, 'soup') and context.soup is not None:
+                logger.info(f"Processing with static parser: {url}")
+                soup = context.soup
+                raw_html = str(soup)
+            else:
+                logger.warning(f"No page or soup available for {url}")
+                return
+            
+            # Extract content using specialized extractors or fallback
+            title, text_content, metadata = self._extract_content(url, soup, raw_html)
+            
+            # Validate and sanitize text content
+            if text_content is None or text_content == "":
+                logger.warning(f"No text content extracted for {url}, skipping")
+                return
+            
+            # Ensure text content is a string
+            text_content = str(text_content)
+            
+            # Add discovered links for recursive crawling (Crawlee handles deduplication)
+            if self.recursive:
+                await context.enqueue_links(strategy="same-hostname")
+            
+            # Check for duplicate content using stable hash
+            content_key = f"{title}:{text_content}"
+            content_hash = hashlib.md5(content_key.encode("utf-8")).hexdigest()
+            
+            if content_hash in self.content_hashes:
+                logger.info(f"Skipping duplicate content for {url}")
+                return
+            
+            self.content_hashes.add(content_hash)
+            
+            # Get last modified header
+            last_modified = getattr(context.response, 'headers', {}).get("Last-Modified") if hasattr(context, 'response') else None
+            
+            # Store document data in dataset
+            await dataset.push_data({
+                'id': url,
+                'sections': [{'link': url, 'text': text_content}],
+                'source': DocumentSource.WEB.value,
+                'semantic_identifier': title or url,
+                'metadata': metadata,
+                'doc_updated_at': _get_datetime_from_last_modified_header(last_modified).isoformat() if last_modified else None,
+            })
+            
+        except Exception as e:
+            logger.error(f"Error processing {url}: {e}")
+    
 
     def validate_connector_settings(self) -> None:
         """Validate connector configuration and test connectivity."""
@@ -601,6 +1064,15 @@ Examples:
   
   # Save batches for ingestion API
   python connector.py --url https://docs.example.com --type recursive --save-batches --batch-dir ./ingestion_batches
+  
+  # Force static crawling (no JavaScript execution)
+  python connector.py --url https://simple-site.com --type recursive --crawler-mode static
+  
+  # Force dynamic crawling (always use Playwright)
+  python connector.py --url https://spa-app.com --type single --crawler-mode dynamic
+  
+  # Skip image files during crawling
+  python connector.py --url https://docs.example.com --type recursive --skip-images
         """
     )
     
@@ -665,6 +1137,52 @@ Examples:
         "--batch-dir",
         default="./batches",
         help="Directory to save batch files (default: ./batches)"
+    )
+    
+    parser.add_argument(
+        "--crawler-mode",
+        choices=["adaptive", "static", "dynamic"],
+        default="adaptive",
+        help="Crawler mode: adaptive (auto-detect JS needs), static (BeautifulSoup only), dynamic (Playwright only). Default: adaptive"
+    )
+    
+    parser.add_argument(
+        "--skip-images",
+        action="store_true",
+        help="Skip image files (PNG, JPG, GIF, etc.) during crawling"
+    )
+    
+    # Generic selector configuration options
+    parser.add_argument(
+        "--selector-config",
+        help="Path to JSON/YAML file with selector configuration"
+    )
+    
+    parser.add_argument(
+        "--content-selector",
+        help="CSS selector for main content extraction"
+    )
+    
+    parser.add_argument(
+        "--title-selector",
+        help="CSS selector for page title extraction"
+    )
+    
+    parser.add_argument(
+        "--links-selector",
+        help="CSS selector for navigation links extraction"
+    )
+    
+    parser.add_argument(
+        "--exclude-selectors",
+        nargs="+",
+        help="CSS selectors for elements to exclude from extraction"
+    )
+    
+    parser.add_argument(
+        "--detection-selectors",
+        nargs="+",
+        help="CSS selectors that must be present for generic extraction to activate"
     )
     
     args = parser.parse_args()
@@ -750,6 +1268,35 @@ Examples:
             print(f"Error saving batch {batch_num}: {e}")
             return None
     
+    # Handle selector configuration from CLI
+    selector_config = None
+    selector_config_file = None
+    
+    # Process CLI selector options
+    if any([args.selector_config, args.content_selector, args.title_selector, 
+            args.links_selector, args.exclude_selectors, args.detection_selectors]):
+        
+        if args.selector_config:
+            selector_config_file = args.selector_config
+        
+        # Create quick config from individual CLI options
+        if any([args.content_selector, args.title_selector, args.links_selector, 
+                args.exclude_selectors, args.detection_selectors]):
+            
+            from onyx.connectors.web.selectors import SelectorResolver
+            resolver = SelectorResolver()
+            
+            quick_config = resolver.create_quick_config(
+                name="cli_custom",
+                title_selector=args.title_selector,
+                content_selector=args.content_selector,
+                links_selector=args.links_selector,
+                exclude_selectors=args.exclude_selectors,
+                detection_selectors=args.detection_selectors
+            )
+            
+            selector_config = quick_config.to_json()
+    
     # Create connector with specified parameters
     try:
         connector = WebConnectorCrawlee(
@@ -758,11 +1305,16 @@ Examples:
             mintlify_cleanup=not args.no_mintlify,
             batch_size=args.batch_size,
             enable_specialized_extraction=not args.no_specialized,
+            crawler_mode=args.crawler_mode,
+            skip_images=args.skip_images,
+            selector_config=selector_config,
+            selector_config_file=selector_config_file,
         )
         
         print(f"Starting {args.type} crawl of: {args.url}")
-        print(f"Adaptive rendering: enabled (automatically detects JS requirements)")
+        print(f"Crawler mode: {args.crawler_mode} {'(automatically detects JS requirements)' if args.crawler_mode == 'adaptive' else ''}")
         print(f"Specialized extraction: {'enabled' if not args.no_specialized else 'disabled'}")
+        print(f"Skip images: {'enabled' if args.skip_images else 'disabled'}")
         print(f"Batch size: {args.batch_size}")
         print(f"Network timeout: {args.timeout}s")
         print("-" * 60)

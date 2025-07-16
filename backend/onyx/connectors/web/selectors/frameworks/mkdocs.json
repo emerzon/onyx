@@ -1,0 +1,31 @@
+{
+  "name": "mkdocs",
+  "detection": [".md-content"],
+  "title": [
+    "h1",
+    ".md-content h1",
+    "article h1",
+    ".md-typeset h1",
+    ".page-title"
+  ],
+  "body": [
+    "div.md-content",
+    ".md-content__inner",
+    "article",
+    "main .md-content",
+    ".md-typeset",
+    ".md-content",
+    "main"
+  ],
+  "metadata": {
+    "date": ["meta[name='date']", ".md-source-date"],
+    "author": ["meta[name='author']", ".md-author"],
+    "category": [".md-nav__title", ".md-tabs__link"]
+  },
+  "exclude": [
+    ".md-content__button",
+    ".headerlink",
+    "button",
+    ".btn"
+  ]
+}
