@@ -1,20 +1,20 @@
 {
   "name": "zoomin",
-  "detection": ["#zDocsContent"],
+  "detection": ["script[src*='zoominsoftware']"],
   "title": [
-    "#zDocsContent header h1",
-    "h1.zDocsTitle",
-    ".zDocsContent h1",
+    "h1",
+    "title",
+    "header h1",
     ".content-title",
-    "h1"
+    ".page-title"
   ],
   "body": [
-    ".zDocsTopicPageBodyContent",
-    "article.zDocsContent",
-    ".zDocsTopicPageBody",
-    "#zDocsContent > div.zDocsTopicPageBody",
-    "main#content",
-    "article.bodytext"
+    "article",
+    "main",
+    ".content",
+    ".main-content",
+    "body",
+    ".topic-content"
   ],
   "metadata": {
     "date": "meta[name='lastMod']",
