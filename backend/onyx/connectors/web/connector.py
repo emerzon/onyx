@@ -35,9 +35,6 @@ Examples:
   # Sitemap-based crawling
   python connector.py --url https://example.com/sitemap.xml --type sitemap
   
-  # Use new async implementation explicitly
-  python connector.py --url https://docs.example.com --type recursive --async
-  
   # Save batches for ingestion API
   python connector.py --url https://docs.example.com --type recursive --save-batches --batch-dir ./ingestion_batches
         """
@@ -51,7 +48,7 @@ Examples:
     
     parser.add_argument(
         "--type", "-t",
-        choices=["single", "recursive", "sitemap", "upload"],
+        choices=["single", "recursive", "sitemap"],
         default="single",
         help="Crawling type (default: single)"
     )
@@ -63,17 +60,6 @@ Examples:
         help=f"Number of documents per batch (default: {INDEX_BATCH_SIZE})"
     )
     
-    parser.add_argument(
-        "--async",
-        action="store_true",
-        help="Use new async implementation (recommended for better performance)"
-    )
-    
-    parser.add_argument(
-        "--legacy",
-        action="store_true", 
-        help="Force use of legacy sync implementation"
-    )
     
     parser.add_argument(
         "--no-mintlify",
@@ -98,12 +84,6 @@ Examples:
         help="Output file to save extracted content (JSON format)"
     )
     
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=30,
-        help="Request timeout in seconds (default: 30)"
-    )
     
     parser.add_argument(
         "--save-batches",
@@ -135,27 +115,10 @@ Examples:
     # Configure logging level
     if args.verbose:
         import logging
+        from onyx.utils.logger import setup_logger
+        logger = setup_logger()
         logging.getLogger().setLevel(logging.DEBUG)
         logger.setLevel(logging.DEBUG)
-    
-    # Determine which implementation to use
-    use_async = getattr(args, 'async')
-    use_legacy = args.legacy
-    
-    if use_async and use_legacy:
-        print("Error: Cannot specify both --async and --legacy flags", file=sys.stderr)
-        sys.exit(1)
-    
-    if use_legacy:
-        use_async_implementation = False
-        print("Using legacy sync implementation")
-    elif use_async:
-        use_async_implementation = True
-        print("Using new async implementation")
-    else:
-        # Default: use async implementation but with compatibility layer
-        use_async_implementation = True
-        print("Using async implementation with compatibility layer (recommended)")
     
     # Setup batch saving if requested
     if args.save_batches:
@@ -227,61 +190,10 @@ Examples:
     
     # Create connector with specified parameters
     try:
-        if use_async and not use_legacy:
-            # Use pure async implementation
-            import asyncio
-            
-            async def run_async_main():
-                connector = WebConnectorCrawlee(
-                    base_url=args.url,
-                    web_connector_type=args.type,
-                    mintlify_cleanup=not args.no_mintlify,
-                    batch_size=args.batch_size,
-                    enable_specialized_extraction=not args.no_specialized,
-                    crawler_mode=args.crawler_mode,
-                    skip_images=args.skip_images,
-                )
-                
-                print(f"Starting {args.type} crawl of: {args.url}")
-                print(f"Crawler mode: {args.crawler_mode}")
-                print(f"Using: Pure Async Implementation")
-                print("-" * 60)
-                
-                all_documents = []
-                batch_count = 0
-                
-                async for batch in connector.load_from_state_async():
-                    batch_count += 1
-                    batch_size = len(batch)
-                    all_documents.extend(batch)
-                    
-                    print(f"Batch {batch_count}: {batch_size} documents")
-                    
-                    # Save batch for ingestion API if requested
-                    if args.save_batches:
-                        saved_file = save_batch_for_ingestion(batch, batch_count, args.url)
-                        if saved_file:
-                            print(f"  Saved to: {saved_file}")
-                
-                print("-" * 60)
-                print(f"Crawling complete! Total: {len(all_documents)} documents in {batch_count} batches")
-                
-                # Report failed URLs
-                if connector.failed_urls:
-                    print(f"\nFailed URLs ({len(connector.failed_urls)}):")
-                    for failed_url, failure_info in connector.failed_urls.items():
-                        error_reason = failure_info["error"]
-                        source_pages = failure_info["source_pages"]
-                        print(f"  {error_reason}: {failed_url}")
-                        if source_pages:
-                            print(f"    Referenced by {len(source_pages)} page(s)")
-                
-                return all_documents
-            
-            all_documents = asyncio.run(run_async_main())
-            
-        else:
-            # Use compatibility wrapper or legacy implementation
+        # Always use async implementation
+        import asyncio
+        
+        async def run_async_main():
             connector = WebConnectorCrawlee(
                 base_url=args.url,
                 web_connector_type=args.type,
@@ -294,14 +206,12 @@ Examples:
             
             print(f"Starting {args.type} crawl of: {args.url}")
             print(f"Crawler mode: {args.crawler_mode}")
-            implementation_type = "Native Async Implementation"
-            print(f"Using: {implementation_type}")
             print("-" * 60)
             
             all_documents = []
             batch_count = 0
             
-            for batch in connector.load_from_state():
+            async for batch in connector.load_from_state_async():
                 batch_count += 1
                 batch_size = len(batch)
                 all_documents.extend(batch)
@@ -320,12 +230,12 @@ Examples:
             # Report failed URLs
             if connector.failed_urls:
                 print(f"\nFailed URLs ({len(connector.failed_urls)}):")
-                for failed_url, failure_info in connector.failed_urls.items():
-                    error_reason = failure_info["error"]
-                    source_pages = failure_info["source_pages"]
+                for failed_url, error_reason in connector.failed_urls.items():
                     print(f"  {error_reason}: {failed_url}")
-                    if source_pages:
-                        print(f"    Referenced by {len(source_pages)} page(s)")
+            
+            return all_documents
+        
+        all_documents = asyncio.run(run_async_main())
         
         # Save to file if requested
         if args.output:
