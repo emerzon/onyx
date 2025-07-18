@@ -25,6 +25,7 @@ from crawlee.crawlers import (
 from crawlee import ConcurrencySettings
 from crawlee.storages import Dataset
 from crawlee.request_loaders import SitemapRequestLoader, RequestList
+from crawlee.http_clients import HttpxHttpClient
 
 from onyx.configs.app_configs import INDEX_BATCH_SIZE, WEB_CONNECTOR_VALIDATE_URLS
 from onyx.configs.constants import DocumentSource
@@ -311,27 +312,27 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             # Convert string patterns to regex patterns for SitemapRequestLoader
             import re
             from crawlee.http_clients import HttpxHttpClient
+            import httpx
 
             exclude_regexes = (
                 [re.compile(pattern.replace("*", ".*")) for pattern in exclude_patterns] if exclude_patterns else None
             )
 
-            # Create HTTP client for sitemap loader with reduced connection limits
+            # Create HTTP client for sitemap loader with proper limits
             crawlee_http_client = HttpxHttpClient(
-                # Configure to prevent connection pool exhaustion
+                # Configure for better performance with HTTP/2
                 persist_cookies_per_session=True,
-                http2=False,  # Disable HTTP/2 to avoid connection pool issues
-                # Pass httpx client kwargs through the async_client_kwargs parameter
+                http2=True,  # Enable HTTP/2 for better performance
                 timeout=httpx.Timeout(
                     connect=10.0,
-                    read=45.0,  # Match the 45s timeout from logs
+                    read=30.0,
                     write=10.0,
-                    pool=5.0,
+                    pool=10.0,
                 ),
                 limits=httpx.Limits(
-                    max_connections=5,  # Further reduced to prevent file descriptor exhaustion
-                    max_keepalive_connections=2,
-                    keepalive_expiry=15,  # Shorter keepalive to free up resources faster
+                    max_connections=10,
+                    max_keepalive_connections=10,
+                    keepalive_expiry=30,
                 ),
             )
 
@@ -517,85 +518,7 @@ class AsyncWebConnectorCrawlee(LoadConnector):
 
         return is_duplicate, content_hash
 
-    async def _update_metrics(self, metric_name: str, value: Any = 1, operation: str = "increment") -> None:
-        """
-        Update crawler metrics in thread-safe manner.
 
-        Args:
-            metric_name: Name of the metric to update
-            value: Value to add/set (default: 1)
-            operation: 'increment', 'set', or 'average'
-        """
-        async with self._metrics_lock:
-            if operation == "increment":
-                self._metrics[metric_name] = self._metrics.get(metric_name, 0) + value
-            elif operation == "set":
-                self._metrics[metric_name] = value
-            elif operation == "average":
-                # Simple moving average for processing time
-                current_avg = self._metrics.get(metric_name, 0.0)
-                count = self._metrics.get("pages_processed", 1)
-                self._metrics[metric_name] = (current_avg * (count - 1) + value) / count
-
-    async def _increment_error_category(self, category: str) -> None:
-        """Increment error count for a specific category."""
-        async with self._metrics_lock:
-            if "error_categories" not in self._metrics:
-                self._metrics["error_categories"] = {}
-            self._metrics["error_categories"][category] = self._metrics["error_categories"].get(category, 0) + 1
-
-    async def _get_metrics_snapshot(self) -> dict[str, Any]:
-        """Get current metrics snapshot."""
-        async with self._metrics_lock:
-            snapshot = self._metrics.copy()
-
-            # Calculate derived metrics
-            if snapshot["crawl_start_time"]:
-                elapsed_time = time.time() - snapshot["crawl_start_time"]
-                snapshot["elapsed_time"] = elapsed_time
-                if elapsed_time > 0:
-                    snapshot["pages_per_second"] = snapshot["pages_processed"] / elapsed_time
-                    snapshot["documents_per_second"] = snapshot["documents_created"] / elapsed_time
-                else:
-                    snapshot["pages_per_second"] = 0
-                    snapshot["documents_per_second"] = 0
-            else:
-                snapshot["elapsed_time"] = 0
-                snapshot["pages_per_second"] = 0
-                snapshot["documents_per_second"] = 0
-
-            # Calculate success rate
-            total_pages = snapshot["pages_processed"]
-            if total_pages > 0:
-                snapshot["success_rate"] = snapshot["pages_successful"] / total_pages
-                snapshot["failure_rate"] = snapshot["pages_failed"] / total_pages
-                snapshot["skip_rate"] = snapshot["pages_skipped"] / total_pages
-            else:
-                snapshot["success_rate"] = 0
-                snapshot["failure_rate"] = 0
-                snapshot["skip_rate"] = 0
-
-            return snapshot
-
-    async def _log_progress_metrics(self, force: bool = False) -> None:
-        """Log current progress metrics."""
-        metrics = await self._get_metrics_snapshot()
-
-        # Only log if significant progress or forced
-        if force or metrics["pages_processed"] % 50 == 0:
-            logger.info(
-                f"Crawl Progress - "
-                f"Processed: {metrics['pages_processed']} pages, "
-                f"Created: {metrics['documents_created']} documents, "
-                f"Failed: {metrics['pages_failed']}, "
-                f"Skipped: {metrics['pages_skipped']}, "
-                f"Rate: {metrics['pages_per_second']:.1f} pages/sec, "
-                f"Success: {metrics['success_rate']:.1%}"
-            )
-
-            if metrics["error_categories"]:
-                error_summary = ", ".join([f"{cat}:{count}" for cat, count in metrics["error_categories"].items()])
-                logger.info(f"Error breakdown: {error_summary}")
 
     async def _add_document(self, document: Document) -> None:
         """Add document to collection in thread-safe manner."""
@@ -713,7 +636,7 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             await self.metrics_collector.record_page_processed(success=True, bytes_processed=len(text_content))
             await self.metrics_collector.record_document_created()
             if content_type == "pdf":
-                await self._update_metrics("pdfs_processed")
+                await self.metrics_collector.update_metric("pdfs_processed", 1)
         except Exception as e:
             logger.error(f"Error processing file {url}: {e}")
             await self.metrics_collector.record_page_processed(success=False)
@@ -1044,78 +967,137 @@ class AsyncWebConnectorCrawlee(LoadConnector):
 
             os.environ["CRAWLEE_STORAGE_DIR"] = storage_dir
 
-            # Open dataset - Crawlee will handle all data storage
-            dataset = await Dataset.open(name="results")
-
             # Create crawler based on mode
             crawler = await self._create_crawler()
 
             # Setup handlers - now they push directly to dataset instead of queue
             await self._setup_crawler_handlers(crawler, None)
 
-            # Start crawling - let Crawlee handle request management
-            logger.info("Starting Crawlee crawl...")
-            if self.request_manager and hasattr(crawler, "_request_manager") and crawler._request_manager:
-                # Using RequestManager (from SitemapRequestLoader.to_tandem())
-                logger.info("Using Crawlee RequestManager")
-                await crawler.run()
-            elif self.request_loader:
-                # Use request loader
-                if hasattr(self.request_loader, "get_total_count"):
-                    # RequestList
-                    total_count = await self.request_loader.get_total_count()
-                    logger.info(f"Using RequestList with {total_count} requests")
-                    requests_to_crawl = []
-                    while not await self.request_loader.is_empty():
-                        request = await self.request_loader.fetch_next_request()
-                        if request:
-                            requests_to_crawl.append(request)
-                    await crawler.run(requests_to_crawl)
-                elif hasattr(self.request_loader, "__iter__"):
-                    # Iterable
-                    await crawler.run(list(self.request_loader))
-                else:
-                    # Single request
-                    await crawler.run([self.request_loader])
-            else:
-                # Fallback - single URL
-                await crawler.run([self.base_url])
-
-            # Process dataset using Crawlee's native async iteration
-            logger.info("Crawling complete, processing dataset...")
-
-            # Debug: Check dataset size
-            dataset_info = await dataset.get_info()
-            logger.info(f"Dataset info: {dataset_info}")
-
-            documents_processed = 0
+            # Open the dataset before starting the crawl
+            dataset = await Dataset.open()
+            
+            # Create a background task to periodically yield batches
+            batch_queue = asyncio.Queue(maxsize=5)  # Limit queue size to control memory
+            
+            async def process_dataset_periodically():
+                """Periodically check dataset and queue batches for yielding."""
+                last_offset = 0
+                batch_documents = []
+                
+                while True:
+                    try:
+                        # Get new items from the dataset
+                        result = await dataset.get_data(
+                            offset=last_offset,
+                            limit=100,  # Process in chunks
+                            skip_empty=True
+                        )
+                        
+                        if not result or not result.items:
+                            # No new items, wait and retry
+                            await asyncio.sleep(2)
+                            continue
+                        
+                        # Process new items from the result
+                        for item in result.items:
+                            doc = await self._convert_dataset_item_to_document(item)
+                            if doc:
+                                batch_documents.append(doc)
+                                
+                                # Queue batch when full
+                                if len(batch_documents) >= self.batch_size:
+                                    await batch_queue.put(batch_documents.copy())
+                                    batch_documents.clear()
+                        
+                        last_offset += len(result.items)
+                        
+                    except Exception as e:
+                        if "Statistics is not active" not in str(e):
+                            logger.debug(f"Dataset polling error (expected during shutdown): {e}")
+                        break
+                
+                # Queue any remaining documents
+                if batch_documents:
+                    await batch_queue.put(batch_documents)
+                
+                # Signal completion
+                await batch_queue.put(None)
+            
+            # Start the background processor
+            processor_task = asyncio.create_task(process_dataset_periodically())
+            
+            # Start crawling in a separate task
+            crawl_complete = False
+            
+            async def run_crawl():
+                nonlocal crawl_complete
+                try:
+                    logger.info("Starting Crawlee crawl...")
+                    if self.request_manager and hasattr(crawler, "_request_manager") and crawler._request_manager:
+                        # Using RequestManager (from SitemapRequestLoader.to_tandem())
+                        logger.info("Using Crawlee RequestManager")
+                        await crawler.run()
+                    elif self.request_loader:
+                        # Use request loader
+                        if hasattr(self.request_loader, "get_total_count"):
+                            # RequestList
+                            total_count = await self.request_loader.get_total_count()
+                            logger.info(f"Using RequestList with {total_count} requests")
+                            requests_to_crawl = []
+                            while not await self.request_loader.is_empty():
+                                request = await self.request_loader.fetch_next_request()
+                                if request:
+                                    requests_to_crawl.append(request)
+                            await crawler.run(requests_to_crawl)
+                        elif hasattr(self.request_loader, "__iter__"):
+                            # Iterable
+                            await crawler.run(list(self.request_loader))
+                        else:
+                            # Single request
+                            await crawler.run([self.request_loader])
+                    else:
+                        # Fallback - single URL
+                        await crawler.run([self.base_url])
+                finally:
+                    crawl_complete = True
+            
+            crawl_task = asyncio.create_task(run_crawl())
+            
+            # Yield batches as they become available
             batches_yielded = 0
-            batch_documents = []
+            while True:
+                try:
+                    # Wait for a batch with timeout
+                    batch = await asyncio.wait_for(batch_queue.get(), timeout=5.0)
+                    
+                    if batch is None:
+                        # Processor signaled completion
+                        break
+                    
+                    batches_yielded += 1
+                    logger.debug(f"Yielding batch {batches_yielded} with {len(batch)} documents")
+                    yield batch
+                    
+                except asyncio.TimeoutError:
+                    # Check if crawl is done
+                    if crawl_complete and batch_queue.empty():
+                        # Give processor a bit more time to finish
+                        await asyncio.sleep(2)
+                        if batch_queue.empty():
+                            break
+            
+            # Ensure crawl completes
+            await crawl_task
+            
+            # Cancel the processor
+            processor_task.cancel()
+            try:
+                await processor_task
+            except asyncio.CancelledError:
+                pass
 
-            # Use Crawlee's native async iteration for optimal memory efficiency
-            # Note: FileSystemDatasetClient doesn't support 'clean' parameter
-            async for item in dataset.iterate_items():
-                # Convert dataset item to Document
-                doc = await self._convert_dataset_item_to_document(item)
-                if doc:
-                    batch_documents.append(doc)
-                    documents_processed += 1
-
-                    # Yield batch when full
-                    if len(batch_documents) >= self.batch_size:
-                        batches_yielded += 1
-                        logger.debug(f"Yielding batch {batches_yielded} with {len(batch_documents)} documents")
-                        yield batch_documents
-                        batch_documents = []
-
-            # Yield final batch if any documents remain
-            if batch_documents:
-                batches_yielded += 1
-                logger.debug(f"Yielding final batch {batches_yielded} with {len(batch_documents)} documents")
-                yield batch_documents
-
-            # Final statistics
-            logger.info(f"Crawl completed: {documents_processed} total documents processed, {batches_yielded} batches yielded")
+            # Final processing complete
+            logger.info(f"Crawl completed: {batches_yielded} batches yielded during crawl")
 
             # Log final metrics
             await self.metrics_collector.log_final_metrics()
@@ -1167,13 +1149,16 @@ class AsyncWebConnectorCrawlee(LoadConnector):
 
     async def _create_crawler(self):
         """Create crawler based on configured mode with enhanced error handling."""
-        # Use reduced concurrency to prevent connection pool exhaustion and file descriptor limits
+        # Import httpx at method level to ensure it's available
+        import httpx
+        
+        # Configure concurrency for HTTP/2 - limit concurrent streams per connection
         concurrency_settings = ConcurrencySettings(
-            # Further reduce concurrent requests to prevent file descriptor exhaustion
-            desired_concurrency=5,  # Target 5 concurrent requests (further reduced)
-            max_concurrency=10,  # Hard limit at 10 (further reduced)
+            # Balanced settings for HTTP/2 multiplexing
+            desired_concurrency=10,  # Target 10 concurrent requests
+            max_concurrency=20,  # Hard limit at 20 to prevent stream exhaustion
             min_concurrency=1,  # Keep at least 1 active
-            max_tasks_per_minute=60,  # Limit rate to prevent overwhelming server
+            max_tasks_per_minute=120,  # Reasonable rate limit
         )
 
         # Configure statistics with error snapshots for debugging
@@ -1335,22 +1320,24 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             elif self.crawler_mode == "static":
                 logger.info("Creating static crawler with reduced concurrency settings")
                 return BeautifulSoupCrawler(
-                    request_handler_timeout=timedelta(seconds=45),
-                    max_request_retries=2,  # Reduce retries to fail faster
-                    # Configure HTTP client to prevent connection issues
+                    request_handler_timeout=timedelta(seconds=60),  # Reasonable timeout for complex pages
+                    max_request_retries=2,  # Allow retries for transient failures
+                    # Configure HTTP client with proper limits for HTTP/2
                     http_client=HttpxHttpClient(
-                        http2=False,  # Disable HTTP/2
-                        # Pass httpx settings through async_client_kwargs
+                        # Allow HTTP/2 for better performance
+                        http2=True,
+                        # Configure timeouts to prevent hanging
                         timeout=httpx.Timeout(
                             connect=10.0,
-                            read=45.0,
+                            read=30.0,  # Match the handler timeout
                             write=10.0,
-                            pool=5.0,
+                            pool=10.0,  # Allow reasonable pool wait time
                         ),
                         limits=httpx.Limits(
-                            max_connections=5,  # Further reduced to prevent file descriptor exhaustion
-                            max_keepalive_connections=2,
-                            keepalive_expiry=15,  # Shorter keepalive to free up resources faster
+                            # HTTP/2 allows many streams per connection
+                            max_connections=10,  # Per-host connection limit
+                            max_keepalive_connections=10,
+                            keepalive_expiry=30,  # Standard keepalive
                         ),
                     ),
                     **crawler_kwargs,
@@ -1372,11 +1359,45 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             # Fallback to static crawler with default configuration
             logger.warning("Falling back to static crawler with default configuration")
             # Fallback crawler - use only basic settings without request_manager
-            return BeautifulSoupCrawler(
-                concurrency_settings=ConcurrencySettings(),
-                request_handler_timeout=timedelta(seconds=30),
-                max_request_retries=2,
-            )
+            # Configure HTTP client to force HTTP/1.1 and prevent deadlocks
+            try:
+                fallback_http_client = HttpxHttpClient(
+                    # Allow HTTP/2 for better performance
+                    http2=True,
+                    timeout=httpx.Timeout(
+                        connect=10.0,
+                        read=30.0,
+                        write=10.0,
+                        pool=10.0,
+                    ),
+                    limits=httpx.Limits(
+                        max_connections=10,
+                        max_keepalive_connections=10,
+                        keepalive_expiry=30,
+                    ),
+                )
+                return BeautifulSoupCrawler(
+                    concurrency_settings=ConcurrencySettings(
+                        desired_concurrency=3,
+                        max_concurrency=5,
+                        min_concurrency=1,
+                        max_tasks_per_minute=30,
+                    ),
+                    request_handler_timeout=timedelta(seconds=30),
+                    max_request_retries=2,
+                    http_client=fallback_http_client,
+                )
+            except Exception as e2:
+                logger.error(f"Failed to create fallback crawler with custom HTTP client: {e2}")
+                # Last resort - minimal crawler
+                return BeautifulSoupCrawler(
+                    concurrency_settings=ConcurrencySettings(
+                        desired_concurrency=1,
+                        max_concurrency=2,
+                    ),
+                    request_handler_timeout=timedelta(seconds=30),
+                    max_request_retries=1,
+                )
 
     async def _setup_crawler_handlers(self, crawler, raw_items_queue=None):
         """Setup crawler handlers for different content types using Crawlee's dataset flow."""
