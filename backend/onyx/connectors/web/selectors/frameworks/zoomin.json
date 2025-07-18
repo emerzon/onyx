@@ -9,6 +9,7 @@
     ".page-title"
   ],
   "body": [
+    ".zDocsTopicPageBodyContent",
     "article",
     "main",
     ".content",
@@ -17,7 +18,8 @@
     ".topic-content"
   ],
   "metadata": {
-    "date": "meta[name='lastMod']",
+    "date": "#zDocsContent > header > ul > li.zDocsTopicPageDate.css-cinqea > span",
+    "lastUpdated": "#zDocsContent > header > ul > li.zDocsTopicPageDate.css-cinqea > span",
     "author": "meta[name='author']"
   },
   "exclude": [

@@ -87,6 +87,18 @@ Examples:
         help="Limit the number of URLs to process from sitemap (useful for testing)"
     )
 
+    parser.add_argument(
+        "--enable-instrumentation",
+        action="store_true",
+        help="Enable performance monitoring and deadlock detection (disabled by default for production)"
+    )
+
+    parser.add_argument(
+        "--global-timeout",
+        type=float,
+        help="Global timeout in seconds for the entire crawl operation (e.g., 3600 for 1 hour)"
+    )
+
     args = parser.parse_args()
 
     # Configure logging level
@@ -176,6 +188,8 @@ Examples:
                 crawler_mode=args.crawler_mode,
                 skip_images=args.skip_images,
                 sitemap_url_limit=args.sitemap_url_limit,
+                enable_instrumentation=args.enable_instrumentation,
+                global_timeout=args.global_timeout,
             )
 
             print(f"Starting {args.type} crawl of: {args.url}")
