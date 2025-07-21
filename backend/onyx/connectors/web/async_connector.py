@@ -12,10 +12,6 @@ import shutil
 import socket
 import tempfile
 import time
-import threading
-import traceback
-import sys
-import signal
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from enum import Enum
@@ -23,6 +19,13 @@ from typing import Any, AsyncGenerator, List, Optional, Dict, Tuple
 from urllib.parse import urlparse, urljoin
 
 import httpx
+
+# Configure Crawlee to use temp directory for storage BEFORE importing
+import os
+import tempfile
+# Set storage to temp directory - much faster especially on tmpfs
+# This must be done before importing any Crawlee modules
+os.environ['CRAWLEE_STORAGE_DIR'] = os.path.join(tempfile.gettempdir(), f"crawlee_{os.getpid()}")
 
 from bs4 import BeautifulSoup
 from crawlee.crawlers import (
@@ -56,261 +59,8 @@ from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
-
-class ThreadDumper:
-    """Utility for capturing thread dumps and async task states."""
-    
-    @staticmethod
-    def get_thread_dump() -> str:
-        """Get a comprehensive thread dump including stack traces."""
-        lines = []
-        lines.append("=" * 80)
-        lines.append(f"THREAD DUMP - {datetime.now(timezone.utc).isoformat()}")
-        lines.append("=" * 80)
-        
-        # Get all threads
-        threads = threading.enumerate()
-        lines.append(f"\nTotal threads: {len(threads)}")
-        lines.append("-" * 80)
-        
-        for thread in threads:
-            lines.append(f"\nThread: {thread.name} (ID: {thread.ident}, Daemon: {thread.daemon})")
-            lines.append(f"  Alive: {thread.is_alive()}")
-            
-            # Get stack trace for this thread
-            if thread.ident:
-                frame = sys._current_frames().get(thread.ident)
-                if frame:
-                    lines.append("  Stack trace:")
-                    for filename, lineno, name, line in traceback.extract_stack(frame):
-                        lines.append(f"    File \"{filename}\", line {lineno}, in {name}")
-                        if line:
-                            lines.append(f"      {line.strip()}")
-        
-        return "\n".join(lines)
-    
-    @staticmethod
-    def get_async_task_dump() -> str:
-        """Get information about all async tasks."""
-        lines = []
-        lines.append("=" * 80)
-        lines.append(f"ASYNC TASK DUMP - {datetime.now(timezone.utc).isoformat()}")
-        lines.append("=" * 80)
-        
-        # Get all tasks
-        tasks = asyncio.all_tasks()
-        lines.append(f"\nTotal tasks: {len(tasks)}")
-        lines.append("-" * 80)
-        
-        # Group tasks by state
-        running = []
-        pending = []
-        done = []
-        cancelled = []
-        
-        for task in tasks:
-            if task.done():
-                if task.cancelled():
-                    cancelled.append(task)
-                else:
-                    done.append(task)
-            else:
-                if task == asyncio.current_task():
-                    running.append(task)
-                else:
-                    pending.append(task)
-        
-        lines.append(f"\nTask states:")
-        lines.append(f"  Running: {len(running)}")
-        lines.append(f"  Pending: {len(pending)}")
-        lines.append(f"  Done: {len(done)}")
-        lines.append(f"  Cancelled: {len(cancelled)}")
-        
-        # Detail each task
-        for category, tasks_list in [("RUNNING", running), ("PENDING", pending), ("DONE", done[:10]), ("CANCELLED", cancelled[:10])]:
-            if tasks_list:
-                lines.append(f"\n{category} TASKS:")
-                for i, task in enumerate(tasks_list):
-                    lines.append(f"\n  Task {i+1}:")
-                    lines.append(f"    Name: {task.get_name()}")
-                    lines.append(f"    Coro: {task.get_coro()}")
-                    
-                    # Get stack if available
-                    if not task.done():
-                        stack = task.get_stack()
-                        if stack:
-                            lines.append("    Stack:")
-                            for frame in stack[:5]:  # Limit to 5 frames
-                                lines.append(f"      {frame}")
-                    
-                    # Get exception if task failed
-                    if task.done() and not task.cancelled():
-                        try:
-                            exception = task.exception()
-                            if exception:
-                                lines.append(f"    Exception: {type(exception).__name__}: {exception}")
-                        except:
-                            pass
-        
-        return "\n".join(lines)
-    
-    @staticmethod
-    def get_event_loop_info() -> str:
-        """Get information about the event loop."""
-        lines = []
-        lines.append("=" * 80)
-        lines.append("EVENT LOOP INFO")
-        lines.append("=" * 80)
-        
-        try:
-            loop = asyncio.get_running_loop()
-            lines.append(f"Loop running: {loop.is_running()}")
-            lines.append(f"Loop closed: {loop.is_closed()}")
-            lines.append(f"Debug mode: {loop.get_debug()}")
-            
-            # Get pending callbacks
-            # Note: This is implementation-specific and might not work on all Python versions
-            if hasattr(loop, '_ready'):
-                lines.append(f"Ready callbacks: {len(loop._ready)}")
-            if hasattr(loop, '_scheduled'):
-                lines.append(f"Scheduled callbacks: {len(loop._scheduled)}")
-                
-        except RuntimeError:
-            lines.append("No running event loop")
-        
-        return "\n".join(lines)
-    
-    @staticmethod
-    def dump_all() -> str:
-        """Get complete diagnostic dump."""
-        sections = []
-        
-        # Thread dump
-        sections.append(ThreadDumper.get_thread_dump())
-        
-        # Async task dump
-        try:
-            sections.append(ThreadDumper.get_async_task_dump())
-        except RuntimeError:
-            sections.append("No async task dump available (no running loop)")
-        
-        # Event loop info
-        sections.append(ThreadDumper.get_event_loop_info())
-        
-        return "\n\n".join(sections)
-
-
-class PerformanceMonitor:
-    """Monitor performance metrics and detect potential deadlocks."""
-    
-    def __init__(self, deadlock_threshold: float = 300.0):
-        self.deadlock_threshold = deadlock_threshold
-        self.operation_times: Dict[str, List[float]] = defaultdict(list)
-        self.active_operations: Dict[str, Dict[str, Any]] = {}
-        self.lock = threading.Lock()
-        self._deadlock_check_task: Optional[asyncio.Task] = None
-        
-    async def start_operation(self, operation_id: str, operation_type: str, metadata: Dict[str, Any] = None) -> None:
-        """Start tracking an operation."""
-        with self.lock:
-            self.active_operations[operation_id] = {
-                "type": operation_type,
-                "start_time": time.perf_counter(),
-                "metadata": metadata or {},
-                "thread_id": threading.current_thread().ident,
-                "task_id": id(asyncio.current_task()),
-            }
-        logger.debug(f"Started operation {operation_id} ({operation_type})")
-    
-    async def end_operation(self, operation_id: str) -> None:
-        """End tracking an operation and record its duration."""
-        with self.lock:
-            if operation_id in self.active_operations:
-                op = self.active_operations.pop(operation_id)
-                duration = time.perf_counter() - op["start_time"]
-                self.operation_times[op["type"]].append(duration)
-                
-                if duration > 10.0:  # Log slow operations
-                    logger.warning(
-                        f"Slow operation detected: {operation_id} ({op['type']}) "
-                        f"took {duration:.2f}s - metadata: {op['metadata']}"
-                    )
-                else:
-                    logger.debug(f"Completed operation {operation_id} in {duration:.2f}s")
-    
-    async def check_deadlocks(self) -> None:
-        """Check for potential deadlocks in active operations."""
-        deadlock_count = 0
-        while True:
-            try:
-                await asyncio.sleep(30)  # Check every 30 seconds
-                current_time = time.perf_counter()
-                
-                detected_deadlocks = []
-                with self.lock:
-                    for op_id, op_info in list(self.active_operations.items()):
-                        duration = current_time - op_info["start_time"]
-                        if duration > self.deadlock_threshold:
-                            detected_deadlocks.append((op_id, op_info, duration))
-                
-                if detected_deadlocks:
-                    deadlock_count += 1
-                    logger.error(f"DEADLOCK DETECTION #{deadlock_count} - Found {len(detected_deadlocks)} stuck operations")
-                    
-                    # Log each deadlock
-                    for op_id, op_info, duration in detected_deadlocks:
-                        logger.error(
-                            f"Potential deadlock: Operation {op_id} ({op_info['type']}) "
-                            f"has been running for {duration:.2f}s\n"
-                            f"Thread: {op_info['thread_id']}, Task: {op_info['task_id']}\n"
-                            f"Metadata: {op_info['metadata']}"
-                        )
-                    
-                    # Capture and log thread dump
-                    logger.error("Capturing diagnostic information...")
-                    dump = ThreadDumper.dump_all()
-                    
-                    # Write to file for analysis
-                    dump_file = f"/tmp/crawler_deadlock_{deadlock_count}_{int(time.time())}.txt"
-                    try:
-                        with open(dump_file, 'w') as f:
-                            f.write(dump)
-                        logger.error(f"Thread dump written to: {dump_file}")
-                    except Exception as e:
-                        logger.error(f"Failed to write thread dump: {e}")
-                    
-                    # Also log key parts to logger
-                    logger.error("Thread dump summary:\n" + dump[:2000] + "\n... (truncated)")
-                    
-            except Exception as e:
-                logger.error(f"Error in deadlock detection: {e}")
-    
-    def get_performance_stats(self) -> Dict[str, Any]:
-        """Get performance statistics."""
-        with self.lock:
-            stats = {}
-            for op_type, times in self.operation_times.items():
-                if times:
-                    stats[op_type] = {
-                        "count": len(times),
-                        "avg": sum(times) / len(times),
-                        "min": min(times),
-                        "max": max(times),
-                        "p95": sorted(times)[int(len(times) * 0.95)] if len(times) > 20 else max(times),
-                    }
-            
-            stats["active_operations"] = len(self.active_operations)
-            stats["active_operation_details"] = [
-                {
-                    "id": op_id,
-                    "type": op["type"],
-                    "duration": time.perf_counter() - op["start_time"],
-                    "metadata": op["metadata"]
-                }
-                for op_id, op in self.active_operations.items()
-            ]
-            
-            return stats
+# Import instrumentation setup
+from onyx.connectors.web.instrumentation import setup_crawler_instrumentation, get_tracer
 
 
 class HostLimitedTransport(httpx.AsyncHTTPTransport):
@@ -425,8 +175,6 @@ def _read_urls_file(location: str) -> list[str]:
 class AsyncWebConnectorCrawlee(LoadConnector):
     """Async-native web connector implementation using Crawlee library with proper async patterns."""
     
-    # Class variable to track instances for signal handling
-    _instances = []
 
     def __init__(
         self,
@@ -439,7 +187,6 @@ class AsyncWebConnectorCrawlee(LoadConnector):
         skip_images: bool = False,
         selector_config: Optional[str] = None,
         selector_config_file: Optional[str] = None,
-        enable_instrumentation: bool = False,
         oauth_token: Optional[str] = None,
         sitemap_url_limit: Optional[int] = None,  # Limit URLs from sitemap
         global_timeout: Optional[float] = None,  # Global timeout in seconds for entire crawl
@@ -465,15 +212,8 @@ class AsyncWebConnectorCrawlee(LoadConnector):
         # Initialize metrics collector
         self.metrics_collector = MetricsCollector()
         
-        # Store instrumentation flag
-        self.enable_instrumentation = enable_instrumentation
-        
         # Store global timeout
         self.global_timeout = global_timeout
-        
-        # Initialize performance monitor only if instrumentation is enabled
-        self.performance_monitor = PerformanceMonitor(deadlock_threshold=300.0) if enable_instrumentation else None
-        self._perf_monitor_task: Optional[asyncio.Task] = None
         
         # Progress tracking
         self.processed_count = 0
@@ -484,17 +224,6 @@ class AsyncWebConnectorCrawlee(LoadConnector):
         # Queue for real-time batch yielding
         self._raw_items_queue = None
         
-        # Register instance for signal handling
-        AsyncWebConnectorCrawlee._instances.append(self)
-        
-        # Setup signal handler for thread dumps (SIGUSR1) only if instrumentation is enabled
-        if enable_instrumentation and not hasattr(AsyncWebConnectorCrawlee, '_signal_handler_installed'):
-            try:
-                signal.signal(signal.SIGUSR1, AsyncWebConnectorCrawlee._handle_dump_signal)
-                AsyncWebConnectorCrawlee._signal_handler_installed = True
-                logger.info("Thread dump signal handler installed (kill -USR1 <pid>)")
-            except Exception as e:
-                logger.warning(f"Could not install signal handler: {e}")
 
         # Legacy properties for backward compatibility
         self.base_url = self.config.base_url
@@ -531,7 +260,7 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             oauth_token=oauth_token,
             max_connections=5,  # Further reduced to prevent connection exhaustion
             max_keepalive_connections=3,
-            max_retries=1,  # Reduced since Crawlee handles retries
+            max_retries=3,  # Increased to handle browser connection failures
             retry_backoff_factor=0.5,
             timeout=30.0,  # Add explicit timeout
             http2=False,  # Disable HTTP/2 to avoid connection pool issues
@@ -574,10 +303,8 @@ class AsyncWebConnectorCrawlee(LoadConnector):
         # Clean up temporary storage directory
         try:
             import shutil
-            import tempfile
-            import os
-            storage_dir = os.path.join(tempfile.gettempdir(), f"crawlee_{os.getpid()}")
-            if os.path.exists(storage_dir):
+            storage_dir = os.environ.get('CRAWLEE_STORAGE_DIR')
+            if storage_dir and os.path.exists(storage_dir):
                 shutil.rmtree(storage_dir)
                 logger.info(f"Cleaned up temporary storage directory: {storage_dir}")
         except Exception as e:
@@ -711,9 +438,9 @@ class AsyncWebConnectorCrawlee(LoadConnector):
 
             # Create SitemapRequestLoader and convert to RequestManager following Crawlee docs
             try:
-                logger.info("Creating SitemapRequestLoader...")
-                logger.info(f"Sitemap URL: {sitemap_url}")
-                logger.info(f"Exclude patterns: {exclude_regexes}")
+                logger.debug("Creating SitemapRequestLoader...")
+                logger.debug(f"Sitemap URL: {sitemap_url}")
+                logger.debug(f"Exclude patterns: {exclude_regexes}")
                 
                 sitemap_loader = SitemapRequestLoader(
                     sitemap_urls=[sitemap_url],  # Use the auto-detected sitemap URL
@@ -721,19 +448,21 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                     exclude=exclude_regexes,
                     max_buffer_size=100000,  # Increased buffer to handle large sitemaps (~80k URLs)
                 )
-                logger.info("SitemapRequestLoader created successfully")
+                logger.debug("SitemapRequestLoader created successfully")
 
                 # Convert to RequestManagerTandem as documented
-                logger.info("Converting SitemapRequestLoader to RequestManager...")
+                logger.debug("Converting SitemapRequestLoader to RequestManager...")
                 try:
-                    # Add timeout for sitemap conversion
-                    async with asyncio.timeout(30):  # 30 second timeout
+                    # Add timeout for sitemap conversion - increased for large sitemaps
+                    timeout_seconds = 300  # 5 minutes for large sitemaps
+                    logger.info(f"Converting sitemap with {timeout_seconds}s timeout...")
+                    async with asyncio.timeout(timeout_seconds):
                         self.request_manager = await sitemap_loader.to_tandem()
                     self.request_loader = None  # We'll use request_manager instead
                     self.sitemap_loader = sitemap_loader  # Store for fallback use
-                    logger.info("SitemapRequestLoader converted successfully")
+                    logger.debug("SitemapRequestLoader converted successfully")
                 except asyncio.TimeoutError:
-                    logger.error("Sitemap loading timed out after 30 seconds")
+                    logger.error(f"Sitemap loading timed out after {timeout_seconds} seconds")
                     raise Exception("Sitemap loading timeout")
 
             except Exception as e:
@@ -942,7 +671,7 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                     logger.warning(f"Specialized extractor failed for {url}: {e}")
 
         # Fallback to standard extraction
-        logger.info(f"Using fallback extraction for {url}")
+        logger.debug(f"Using fallback extraction for {url}")
         title = soup.title.string if soup.title else None
         text_content = convert_html_to_markdown(raw_html)
 
@@ -1020,13 +749,16 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             raise
 
     async def _create_crawler(self):
-        # Configure crawlee to use /tmp for storage (much faster, especially on tmpfs)
-        import tempfile
-        import os
-        storage_dir = os.path.join(tempfile.gettempdir(), f"crawlee_{os.getpid()}")
-        # Set the CRAWLEE_STORAGE_DIR environment variable before importing crawlee
-        os.environ['CRAWLEE_STORAGE_DIR'] = storage_dir
-        logger.info(f"Using temporary storage directory: {storage_dir}")
+        # Log the storage directory being used (already set at module import time)
+        storage_dir = os.environ.get('CRAWLEE_STORAGE_DIR', 'default')
+        logger.info(f"Using Crawlee storage directory: {storage_dir}")
+        
+        # Configure Crawlee to use more system resources when available
+        # These settings allow the AutoscaledPool to be more aggressive
+        os.environ['CRAWLEE_AVAILABLE_MEMORY_RATIO'] = '0.8'  # Use up to 80% of available memory (default is 0.25)
+        os.environ['CRAWLEE_MAX_USED_MEMORY_RATIO'] = '0.9'  # Consider overloaded at 90% memory usage
+        os.environ['CRAWLEE_MAX_USED_CPU_RATIO'] = '0.95'  # Consider overloaded at 95% CPU usage (more tolerant)
+        logger.info("Configured Crawlee for high-performance mode with increased resource limits")
         """Create crawler based on configured mode with enhanced error handling."""
         # Import httpx at method level to ensure it's available
         import httpx
@@ -1035,14 +767,14 @@ class AsyncWebConnectorCrawlee(LoadConnector):
         if self.web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.SITEMAP.value:
             # For sitemap crawling, use higher concurrency
             concurrency_settings = ConcurrencySettings(
-                desired_concurrency=20,  # Start with 20 concurrent requests
-                max_concurrency=50,      # Allow up to 50 concurrent requests
-                min_concurrency=10,      # Keep at least 10 active
-                max_tasks_per_minute=600,  # Allow 600 requests per minute
+                desired_concurrency=40,  # Start with 40 concurrent requests (increased)
+                max_concurrency=100,     # Allow up to 100 concurrent requests (increased)
+                min_concurrency=30,      # Keep at least 30 active (increased to force parallelism)
+                max_tasks_per_minute=2000,  # Allow 2000 requests per minute (increased)
             )
             logger.info("Using optimized concurrency for sitemap crawling")
             # Calculate appropriate stream limit based on max concurrency
-            stream_limit = min(50, concurrency_settings.max_concurrency)
+            stream_limit = min(100, concurrency_settings.max_concurrency)  # Increased to match max_concurrency
             
             # Log a warning if not using static mode for sitemap crawling
             if self.crawler_mode != "static":
@@ -1198,6 +930,7 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                             "use_session_pool": True,  # Enable session pool
                             "max_session_rotations": 5,  # Rotate sessions after 5 uses
                             "use_incognito_pages": True,  # Isolated contexts
+                            "max_request_retries": 3,  # Retry browser failures up to 3 times
                         },
                         **base_crawler_kwargs,
                     )
@@ -1216,6 +949,7 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                                 },
                                 "max_total_sessions": 10,  # Limit total browser instances
                                 "max_session_rotations": 5,  # Rotate sessions after 5 uses
+                                "max_request_retries": 3,  # Retry browser failures up to 3 times
                             },
                             **crawler_kwargs_no_manager,
                         )
@@ -1248,7 +982,7 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                         ),
                     ),
                     request_handler_timeout=timedelta(seconds=30),  # 30 second timeout per request
-                    max_request_retries=2,  # Retry failed requests up to 2 times
+                    max_request_retries=3,  # Retry failed requests up to 3 times
                     **crawler_kwargs,
                 )
             else:  # dynamic
@@ -1259,6 +993,7 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                         "timeout": 30000,
                         "ignore_default_args": ["--enable-automation"],
                     },
+                    max_request_retries=3,  # Retry browser failures up to 3 times
                     use_session_pool=True,  # Enable session pool for better management
                     max_session_rotations=5,  # Rotate sessions after 5 uses
                     use_incognito_pages=True,  # Each page uses its own isolated context
@@ -1309,11 +1044,9 @@ class AsyncWebConnectorCrawlee(LoadConnector):
         @crawler.router.default_handler
         async def async_handler(context) -> None:
             url = context.request.url
-            logger.info(f"Handler invoked for URL: {url}, queue={'available' if self._raw_items_queue else 'NOT available'}")
+            logger.debug(f"Handler invoked for URL: {url}, queue={'available' if self._raw_items_queue else 'NOT available'}")
             operation_id = f"page_{id(context)}_{url[:50]}"
             
-            if self.performance_monitor:
-                await self.performance_monitor.start_operation(operation_id, "page_processing", {"url": url, "context_type": type(context).__name__})
             
             # Update progress tracking
             self.processed_count += 1
@@ -1335,7 +1068,7 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                 self._last_progress_count = self.processed_count
             
             # Debug logging to understand context type
-            logger.debug(f"Handler received context type: {type(context).__name__}")
+            logger.info(f"Handler received context type: {type(context).__name__} for crawler_mode: {self.crawler_mode}")
             logger.debug(f"Context module: {type(context).__module__}")
             
             # List key attributes for debugging
@@ -1358,6 +1091,10 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                 # Handle different content types using Crawlee's native data flow
                 if url.lower().endswith(".pdf") or self.config_manager.is_binary_file_supported(url):
                     await self._handle_file_extraction_async(context)
+                elif self.crawler_mode == "dynamic":
+                    # Force dynamic handling when explicitly set to dynamic mode
+                    logger.info(f"Using dynamic handler for {url} (forced by crawler_mode=dynamic)")
+                    await self._handle_adaptive_page_async(context)
                 elif hasattr(context, "soup"):
                     # BeautifulSoupCrawler context (our original static crawler)
                     logger.debug(f"Using static handler for {url}")
@@ -1397,14 +1134,30 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                     logger.error(f"Context attributes: {[attr for attr in dir(context) if not attr.startswith('_')][:10]}")
                     raise ValueError(f"Cannot determine handler for context type: {type(context).__name__}")
 
+            except RecursionError as e:
+                # Handle Crawlee's RecursionError bug in error handling
+                logger.error(f"RecursionError in Crawlee error handling for {url} - this is a known Crawlee bug")
+                logger.debug("Skipping this URL to continue crawling")
             except Exception as e:
-                if "Client error status code" in str(e):
+                error_str = str(e)
+                if "Client error status code" in error_str:
                     logger.debug(f"Skipping {url} due to client error: {e}")
+                elif "Connection closed while reading from the driver" in error_str:
+                    logger.error(f"Browser connection lost while processing {url} - browser may have crashed")
+                    # Re-raise to trigger retry mechanism
+                    raise
+                elif "ContextPipelineInitializationError" in error_str:
+                    logger.error(f"Failed to initialize context for {url} - likely browser issue")
+                    # Re-raise to trigger retry mechanism
+                    raise
+                elif "Target page, context or browser has been closed" in error_str:
+                    logger.error(f"Browser/page closed unexpectedly for {url}")
+                    # Re-raise to trigger retry mechanism
+                    raise
                 else:
                     logger.error(f"Handler error for {url}: {e}", exc_info=True)
             finally:
-                if self.performance_monitor:
-                    await self.performance_monitor.end_operation(operation_id)
+                pass
 
         # Enhanced failed request handler with SessionPool integration
         async def handle_failed_request(context) -> None:
@@ -1463,8 +1216,13 @@ class AsyncWebConnectorCrawlee(LoadConnector):
         elif any(keyword in error_msg.lower() for keyword in ["timeout", "timed out"]):
             return "timeout", "Connection timeout"
         elif any(keyword in error_msg.lower() for keyword in ["connection", "connect", "network"]):
+            # Special handling for browser connection loss
+            if "connection closed while reading from the driver" in error_msg.lower():
+                return "browser_crash", "Browser connection lost - likely browser crash or resource exhaustion"
+            elif "target page, context or browser has been closed" in error_msg.lower():
+                return "browser_closed", "Browser/page closed unexpectedly"
             return "network_error", "Network error"
-        elif "playwright" in error_msg.lower():
+        elif "playwright" in error_msg.lower() or "contextpipelineinitialization" in error_msg.lower():
             return "browser_error", "Browser error"
         elif "cancelled" in error_msg.lower():
             return "cancelled", "Request cancelled"
@@ -1542,63 +1300,9 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             logger.warning("Unexpected credentials provided for Async Web Connector")
         return None
     
-    def get_performance_summary(self) -> str:
-        """Get a summary of current performance metrics."""
-        if self.performance_monitor:
-            stats = self.performance_monitor.get_performance_stats()
-            return self._format_performance_report(stats)
-        return "Performance monitoring disabled"
     
-    @staticmethod
-    def _handle_dump_signal(signum, frame):
-        """Handle SIGUSR1 signal to dump thread state."""
-        logger.info(f"Received signal {signum} - generating thread dump")
-        try:
-            dump = ThreadDumper.dump_all()
-            
-            # Write to file
-            dump_file = f"/tmp/crawler_manual_dump_{int(time.time())}.txt"
-            with open(dump_file, 'w') as f:
-                f.write(dump)
-            logger.info(f"Thread dump written to: {dump_file}")
-            
-            # Log summary
-            logger.info("Thread dump summary:\n" + dump[:1000] + "\n... (truncated)")
-            
-            # Also trigger performance report for all instances
-            for instance in AsyncWebConnectorCrawlee._instances:
-                if instance.performance_monitor:
-                    perf_report = instance.get_performance_summary()
-                    logger.info(f"Performance report for instance:\n{perf_report}")
-                    
-        except Exception as e:
-            logger.error(f"Error generating thread dump: {e}")
     
-    def get_thread_dump(self) -> str:
-        """Get current thread dump."""
-        if self.enable_instrumentation:
-            return ThreadDumper.dump_all()
-        return "Thread dumping disabled (instrumentation not enabled)"
     
-    def save_thread_dump(self, filename: Optional[str] = None) -> str:
-        """Save thread dump to file and return filename."""
-        if not self.enable_instrumentation:
-            logger.debug("Thread dump skipped - instrumentation not enabled")
-            return "instrumentation_disabled"
-            
-        if not filename:
-            filename = f"/tmp/crawler_dump_{int(time.time())}.txt"
-        
-        dump = self.get_thread_dump()
-        with open(filename, 'w') as f:
-            f.write(dump)
-            f.write("\n\n" + "=" * 80 + "\n")
-            f.write("PERFORMANCE REPORT\n")
-            f.write("=" * 80 + "\n")
-            f.write(self.get_performance_summary())
-        
-        logger.info(f"Thread dump saved to: {filename}")
-        return filename
 
     def load_from_state(self) -> GenerateDocumentsOutput:
         """
@@ -1774,34 +1478,19 @@ class AsyncWebConnectorCrawlee(LoadConnector):
         """
         Main async crawl implementation that yields document batches.
         """
-        # Start deadlock detection if not already running and instrumentation is enabled
-        if self.performance_monitor and not self._perf_monitor_task:
-            self._perf_monitor_task = asyncio.create_task(self.performance_monitor.check_deadlocks())
         
         # Initialize request loader
-        if self.performance_monitor:
-            await self.performance_monitor.start_operation("init_loader", "request_loader_init")
         await self._initialize_request_loader()
-        if self.performance_monitor:
-            await self.performance_monitor.end_operation("init_loader")
         
         # Create crawler instance
-        if self.performance_monitor:
-            await self.performance_monitor.start_operation("create_crawler", "crawler_creation")
         crawler = await self._create_crawler()
-        if self.performance_monitor:
-            await self.performance_monitor.end_operation("create_crawler")
         
         # Create a queue for passing documents from crawler to batch yielder
         # Increased size to prevent blocking when crawler produces documents faster than batch yielding
         doc_queue = asyncio.Queue(maxsize=max(self.batch_size * 10, 1000))
         
         # Setup handlers with the queue
-        if self.performance_monitor:
-            await self.performance_monitor.start_operation("setup_handlers", "handler_setup")
         await self._setup_crawler_handlers(crawler, raw_items_queue=doc_queue)
-        if self.performance_monitor:
-            await self.performance_monitor.end_operation("setup_handlers")
         
         # Create dataset for results
         dataset = await Dataset.open()
@@ -1842,13 +1531,13 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             while not crawler_task.done() or not doc_queue.empty():
                 loop_iterations += 1
                 # Log status periodically
-                if loop_iterations % 10 == 0:
+                if loop_iterations % 100 == 0:
                     logger.info(f"Batch processor loop iteration {loop_iterations}: crawler_done={crawler_task.done()}, queue_size={doc_queue.qsize()}, items_buffered={len(items)}")
                 try:
                     # Wait for documents with timeout
                     doc = await asyncio.wait_for(doc_queue.get(), timeout=1.0)
                     items.append(doc)
-                    logger.info(f"Retrieved document from queue, buffer size: {len(items)}")
+                    logger.debug(f"Retrieved document from queue, buffer size: {len(items)}")
                     
                     # Yield batch when size is reached
                     if len(items) >= self.batch_size:
@@ -1871,9 +1560,9 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                     logger.error(f"Error processing document from queue: {e}")
             
             # Wait for crawler to complete
-            logger.info(f"Waiting for crawler task to complete. Current buffer: {len(items)} items")
+            logger.debug(f"Waiting for crawler task to complete. Current buffer: {len(items)} items")
             await crawler_task
-            logger.info(f"Crawler task completed. Buffer has {len(items)} items")
+            logger.debug(f"Crawler task completed. Buffer has {len(items)} items")
             
             # Yield remaining items from queue
             if items:
@@ -1916,9 +1605,6 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             logger.info(f"Processed {remaining_count} additional items from dataset")
         
         # Log final statistics
-        if self.performance_monitor:
-            perf_stats = self.performance_monitor.get_performance_stats()
-            logger.info(f"Performance statistics: {perf_stats}")
             # Print performance report
             logger.info(f"Final performance report:\n{self._format_performance_report(perf_stats)}")
         
@@ -1931,18 +1617,12 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             
             if self.request_manager and hasattr(crawler, 'run_tandem'):
                 # Use run_tandem for crawlers that support it (BeautifulSoup, Playwright)
-                if self.performance_monitor:
-                    await self.performance_monitor.start_operation("crawl_tandem", "crawl_execution", {"mode": "tandem"})
                 await crawler.run_tandem(self.request_manager)
-                if self.performance_monitor:
-                    await self.performance_monitor.end_operation("crawl_tandem")
             elif self.request_manager:
                 # For AdaptivePlaywrightCrawler, we can't use RequestManager directly
                 # We need to extract URLs from the sitemap loader
                 logger.info("Converting sitemap to URL list for adaptive crawler...")
                 
-                if self.performance_monitor:
-                    await self.performance_monitor.start_operation("extract_urls", "url_extraction", {"source": "sitemap"})
                 urls = []
                 
                 # If we have a sitemap loader, get URLs from it
@@ -1992,12 +1672,7 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                             # Check if extraction is taking too long
                             if extraction_duration > 300:  # 5 minutes
                                 logger.warning("URL extraction taking very long")
-                                if self.enable_instrumentation:
-                                    logger.warning("Capturing diagnostic info...")
-                                    self.save_thread_dump()
                 
-                if self.performance_monitor:
-                    await self.performance_monitor.end_operation("extract_urls")
                 
                 logger.info(f"Found {len(urls)} URLs from sitemap")
                 if urls:
@@ -2006,67 +1681,29 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                     self.total_urls = len(urls)
                     logger.info(f"Processing {self.total_urls} URLs from sitemap")
                     
-                    if self.performance_monitor:
-                        await self.performance_monitor.start_operation("crawl_urls", "crawl_execution", 
-                            {"mode": "sitemap_urls", "count": self.total_urls})
                     
                     try:
-                        # For very large sitemaps, process in chunks to avoid file system overload
+                        # Pass all URLs to the crawler - Crawlee will handle them efficiently
                         if len(urls) > 10000:
-                            logger.warning(f"Large sitemap with {len(urls)} URLs detected. Processing in chunks...")
-                            chunk_size = 5000  # Process 5000 URLs at a time
-                            for i in range(0, len(urls), chunk_size):
-                                chunk = urls[i:i + chunk_size]
-                                logger.info(f"Processing chunk {i//chunk_size + 1}/{(len(urls) + chunk_size - 1)//chunk_size} with {len(chunk)} URLs")
-                                
-                                # Add timeout for each chunk
-                                timeout_seconds = 600.0  # 10 minutes per chunk
-                                crawl_task = asyncio.create_task(crawler.run(chunk))
-                                try:
-                                    await asyncio.wait_for(crawl_task, timeout=timeout_seconds)
-                                except asyncio.TimeoutError:
-                                    logger.warning(f"Chunk {i//chunk_size + 1} timed out after {timeout_seconds/60:.1f} minutes")
-                                    # Continue with next chunk
-                                
-                                # Small delay between chunks to let file system catch up
-                                await asyncio.sleep(1.0)
-                        else:
-                            # Pass all URLs to the crawler at once
-                            # Crawlee will handle them efficiently with its internal queue
-                            logger.info(f"Starting crawler.run() with {len(urls)} URLs")
-                            logger.info(f"Queue status before crawler.run(): {'available' if self._raw_items_queue else 'NOT available'}")
-                            
-                            # Add timeout to prevent infinite hanging
-                            # For large sitemaps, use a longer timeout
-                            timeout_seconds = 3600.0 if len(urls) > 1000 else 300.0  # 1 hour for large, 5 min for small
-                            logger.info(f"Using {timeout_seconds}s timeout for {len(urls)} URLs")
-                            
-                            crawl_task = asyncio.create_task(crawler.run(urls))
-                            try:
-                                await asyncio.wait_for(crawl_task, timeout=timeout_seconds)
-                            except asyncio.TimeoutError:
-                                logger.error(f"Crawler timed out after {timeout_seconds/60:.1f} minutes")
-                            logger.error(f"Processed {self.processed_count} out of {len(urls)} URLs before timeout")
-                            # Save diagnostic info if instrumentation is enabled
-                            if self.enable_instrumentation:
-                                self.save_thread_dump()
-                            # Don't raise - let it yield what was processed
-                            logger.warning("Continuing with partial results after timeout")
+                            logger.warning(f"Large sitemap with {len(urls)} URLs detected")
+                        
+                        logger.info(f"Starting crawler with {len(urls)} URLs from sitemap")
+                        logger.info(f"Queue status before crawler.run(): {'available' if self._raw_items_queue else 'NOT available'}")
+                        
+                        # Run the crawler without timeout - let Crawlee manage its own timeouts
+                        await crawler.run(urls)
                         
                         logger.info(f"Crawler completed. Processed {self.processed_count} out of {len(urls)} URLs")
                     except Exception as e:
                         logger.error(f"Error processing URLs: {e}")
                         raise
                     finally:
-                        if self.performance_monitor:
-                            await self.performance_monitor.end_operation("crawl_urls")
+                        pass
                 else:
                     logger.warning("No URLs found in sitemap")
                     # If no URLs found, try the original URL
                     if hasattr(self, 'base_url'):
                         logger.info(f"Falling back to crawling base URL: {self.base_url}")
-                        if self.performance_monitor:
-                            await self.performance_monitor.start_operation("crawl_fallback", "crawl_execution", {"mode": "fallback"})
                         # Apply timeout for fallback crawl
                         if self.global_timeout:
                             remaining_time = self.global_timeout - (time.perf_counter() - crawl_start_time)
@@ -2077,12 +1714,8 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                                 logger.warning("Global timeout already exceeded, skipping fallback crawl")
                         else:
                             await crawler.run([self.base_url])
-                        if self.performance_monitor:
-                            await self.performance_monitor.end_operation("crawl_fallback")
             elif self.request_loader:
                 # RequestList can be passed directly to crawler.run()
-                if self.performance_monitor:
-                    await self.performance_monitor.start_operation("crawl_loader", "crawl_execution", {"mode": "request_loader"})
                 # Apply timeout for request loader crawl
                 if self.global_timeout:
                     remaining_time = self.global_timeout - (time.perf_counter() - crawl_start_time)
@@ -2093,8 +1726,6 @@ class AsyncWebConnectorCrawlee(LoadConnector):
                         logger.warning("Global timeout already exceeded, skipping crawl")
                 else:
                     await crawler.run(self.request_loader)
-                if self.performance_monitor:
-                    await self.performance_monitor.end_operation("crawl_loader")
             else:
                 raise ValueError("No request loader or manager available")
             
@@ -2214,16 +1845,16 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             }
             logger.debug(f"Pushing data to dataset for {url}")
             await context.push_data(data_item)
-            logger.info(f"Successfully pushed {url} to dataset")
+            logger.debug(f"Successfully pushed {url} to dataset")
             
             # If we have a queue, also convert and push the document for immediate batch yielding
             if self._raw_items_queue:
-                logger.info(f"Queue is available, pushing document for {url}")
+                logger.debug(f"Queue is available, pushing document for {url}")
                 try:
                     doc = await self._convert_dataset_item_to_document(data_item)
                     if doc:
                         await self._raw_items_queue.put(doc)
-                        logger.info(f"Pushed document to queue for {url} (queue size: {self._raw_items_queue.qsize()})")
+                        logger.debug(f"Pushed document to queue for {url} (queue size: {self._raw_items_queue.qsize()})")
                     else:
                         logger.warning(f"Document conversion returned None for {url}")
                 except asyncio.QueueFull:
@@ -2293,16 +1924,16 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             }
             
             await context.push_data(data_item)
-            logger.info(f"Successfully pushed {url} to dataset")
+            logger.debug(f"Successfully pushed {url} to dataset")
             
             # If we have a queue, also convert and push the document for immediate batch yielding
             if self._raw_items_queue:
-                logger.info(f"Queue is available, pushing document for {url}")
+                logger.debug(f"Queue is available, pushing document for {url}")
                 try:
                     doc = await self._convert_dataset_item_to_document(data_item)
                     if doc:
                         await self._raw_items_queue.put(doc)
-                        logger.info(f"Pushed document to queue for {url} (queue size: {self._raw_items_queue.qsize()})")
+                        logger.debug(f"Pushed document to queue for {url} (queue size: {self._raw_items_queue.qsize()})")
                     else:
                         logger.warning(f"Document conversion returned None for {url}")
                 except asyncio.QueueFull:
@@ -2321,34 +1952,6 @@ class AsyncWebConnectorCrawlee(LoadConnector):
             logger.error(f"Error handling adaptive page {url}: {e}")
             raise
 
-    def _format_performance_report(self, stats: Dict[str, Any]) -> str:
-        """Format performance statistics into a readable report."""
-        lines = ["=" * 60]
-        lines.append("PERFORMANCE REPORT")
-        lines.append("=" * 60)
-        
-        # Operation statistics
-        for op_type, op_stats in stats.items():
-            if isinstance(op_stats, dict) and 'count' in op_stats:
-                lines.append(f"\n{op_type}:")
-                lines.append(f"  Count: {op_stats['count']}")
-                lines.append(f"  Avg: {op_stats['avg']:.2f}s")
-                lines.append(f"  Min: {op_stats['min']:.2f}s")
-                lines.append(f"  Max: {op_stats['max']:.2f}s")
-                lines.append(f"  P95: {op_stats['p95']:.2f}s")
-        
-        # Active operations
-        if 'active_operations' in stats:
-            lines.append(f"\nActive Operations: {stats['active_operations']}")
-            if stats['active_operations'] > 0 and 'active_operation_details' in stats:
-                lines.append("Active Operation Details:")
-                for op in stats['active_operation_details']:
-                    lines.append(f"  - {op['type']} ({op['id'][:20]}...): {op['duration']:.2f}s")
-                    if op['metadata']:
-                        lines.append(f"    Metadata: {op['metadata']}")
-        
-        lines.append("=" * 60)
-        return "\n".join(lines)
     
     async def _get_metrics_snapshot(self) -> dict[str, Any]:
         """Get a snapshot of current metrics."""

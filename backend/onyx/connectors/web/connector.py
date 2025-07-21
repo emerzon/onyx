@@ -88,12 +88,6 @@ Examples:
     )
 
     parser.add_argument(
-        "--enable-instrumentation",
-        action="store_true",
-        help="Enable performance monitoring and deadlock detection (disabled by default for production)"
-    )
-
-    parser.add_argument(
         "--global-timeout",
         type=float,
         help="Global timeout in seconds for the entire crawl operation (e.g., 3600 for 1 hour)"
@@ -188,7 +182,6 @@ Examples:
                 crawler_mode=args.crawler_mode,
                 skip_images=args.skip_images,
                 sitemap_url_limit=args.sitemap_url_limit,
-                enable_instrumentation=args.enable_instrumentation,
                 global_timeout=args.global_timeout,
             )
 
