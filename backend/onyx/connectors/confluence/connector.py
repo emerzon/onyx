@@ -7,6 +7,7 @@ from urllib.parse import quote
 
 from requests.exceptions import HTTPError
 from typing_extensions import override
+from onyx.db.enums import AccessType
 
 from onyx.access.models import ExternalAccess
 from onyx.configs.app_configs import CONFLUENCE_CONNECTOR_LABELS_TO_SKIP
@@ -124,8 +125,8 @@ class ConfluenceConnector(
         self._low_timeout_confluence_client: OnyxConfluence | None = None
         self._fetched_titles: set[str] = set()
         self.allow_images = False
-        # Only enumerate permissions when explicitly enabled (EE perm sync)
-        self._permission_sync_enabled: bool = False
+        # Permission mode: PUBLIC, PRIVATE, or SYNC. Controls whether to compute external_access.
+        self._permission_mode: AccessType | None = None
 
         # Remove trailing slash from wiki_base if present
         self.wiki_base = wiki_base.rstrip("/")
@@ -219,11 +220,11 @@ class ConfluenceConnector(
 
         self._low_timeout_confluence_client = low_timeout_confluence_client
 
-    def enable_permission_sync(self) -> None:
-        """Enable external permission enumeration for this connector instance.
-        Used only by EE permission sync flows.
+    def set_permission_mode(self, access_type: AccessType) -> None:
+        """Set the connector permission mode (PUBLIC, PRIVATE, SYNC).
+        Only when set to SYNC do we expand and compute external_access during slim-doc retrieval.
         """
-        self._permission_sync_enabled = True
+        self._permission_mode = access_type
 
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
         raise NotImplementedError("Use set_credentials_provider with this connector.")
@@ -581,15 +582,15 @@ class ConfluenceConnector(
         Does not fetch actual text. Used primarily for incremental permission sync.
         """
         doc_metadata_list: list[SlimDocument] = []
-        # Only expand permissions when explicit permission sync is enabled.
+        # Only expand permissions when access type is SYNC
         restrictions_expand = (
             ",".join(_RESTRICTIONS_EXPANSION_FIELDS)
-            if self._permission_sync_enabled
+            if self._permission_mode == AccessType.SYNC
             else None
         )
 
         space_level_access_info: dict[str, ExternalAccess] = {}
-        if self._permission_sync_enabled:
+        if self._permission_mode == AccessType.SYNC:
             space_level_access_info = get_all_space_permissions(
                 self.confluence_client, self.is_cloud
             )
@@ -597,7 +598,7 @@ class ConfluenceConnector(
         def get_external_access(
             doc_id: str, restrictions: dict[str, Any], ancestors: list[dict[str, Any]]
         ) -> ExternalAccess | None:
-            if not self._permission_sync_enabled:
+            if self._permission_mode != AccessType.SYNC:
                 return None
             return get_page_restrictions(
                 self.confluence_client, doc_id, restrictions, ancestors
@@ -623,7 +624,7 @@ class ConfluenceConnector(
                     id=page_id,
                     external_access=(
                         get_external_access(page_id, page_restrictions, page_ancestors)
-                        if self._permission_sync_enabled
+                        if self._permission_mode == AccessType.SYNC
                         else None
                     ),
                 )
@@ -644,7 +645,7 @@ class ConfluenceConnector(
                     continue
 
                 attachment_restrictions = attachment.get("restrictions", {})
-                if self._permission_sync_enabled and not attachment_restrictions:
+                if self._permission_mode == AccessType.SYNC and not attachment_restrictions:
                     attachment_restrictions = page_restrictions or {}
 
                 attachment_space_key = attachment.get("space", {}).get("key")
@@ -663,7 +664,7 @@ class ConfluenceConnector(
                             get_external_access(
                                 attachment_id, attachment_restrictions, []
                             )
-                            if self._permission_sync_enabled
+                            if self._permission_mode == AccessType.SYNC
                             else None
                         ),
                     )
