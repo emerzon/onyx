@@ -37,6 +37,8 @@ def confluence_doc_sync(
     confluence_connector = ConfluenceConnector(
         **cc_pair.connector.connector_specific_config
     )
+    # Explicitly enable permission enumeration for EE sync flows
+    confluence_connector.enable_permission_sync()
 
     provider = OnyxDBCredentialsProvider(
         get_current_tenant_id(), "confluence", cc_pair.credential_id
