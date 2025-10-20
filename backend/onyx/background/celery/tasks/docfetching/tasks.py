@@ -383,6 +383,8 @@ def docfetching_proxy_task(
     """
     # TODO: remove dependence on Redis
     start = time.monotonic()
+    last_activity_time = start
+    last_heartbeat_count: int | None = None
 
     result = SimpleJobResult()
 
@@ -477,7 +479,7 @@ def docfetching_proxy_task(
         while True:
             sleep(5)
 
-            time.monotonic()
+            now = time.monotonic()
 
             # if the job is done, clean up and break
             if job.done():
@@ -522,6 +524,19 @@ def docfetching_proxy_task(
 
                     if not index_attempt:
                         continue
+
+                    # Track activity based on heartbeat increments
+                    if last_heartbeat_count is None:
+                        last_heartbeat_count = index_attempt.heartbeat_counter
+                        last_activity_time = now
+                    elif index_attempt.heartbeat_counter != last_heartbeat_count:
+                        last_heartbeat_count = index_attempt.heartbeat_counter
+                        last_activity_time = now
+
+                    # Activity timeout: terminate if no progress for too long
+                    if now - last_activity_time > CELERY_INDEXING_WATCHDOG_CONNECTOR_TIMEOUT:
+                        result.status = IndexingWatchdogTerminalStatus.TERMINATED_BY_ACTIVITY_TIMEOUT
+                        break
 
                     if not index_attempt.is_finished():
                         continue
