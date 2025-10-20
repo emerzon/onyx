@@ -1454,8 +1454,14 @@ def _docprocessing_task(
             },
             tenant_id=tenant_id,
         )
-        # Clean up this batch after successful processing
-        storage.delete_batch_by_num(batch_num)
+        # Clean up this batch after successful processing.
+        # Do not fail the task if deletion fails; avoid retry double-counting.
+        try:
+            storage.delete_batch_by_num(batch_num)
+        except Exception:
+            task_logger.exception(
+                f"Failed to delete batch from storage: batch_num={batch_num} attempt={index_attempt_id}"
+            )
 
         elapsed_time = time.monotonic() - start_time
         task_logger.info(
