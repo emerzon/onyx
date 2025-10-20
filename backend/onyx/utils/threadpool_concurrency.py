@@ -134,10 +134,12 @@ class ThreadSafeDict(MutableMapping[KT, VT]):
         with self.lock:
             self._dict.update(*args, **kwargs)
 
-    def items(self) -> collections.abc.ItemsView[KT, VT]:
-        """Return a view of (key, value) pairs atomically."""
+    def items(self) -> list[tuple[KT, VT]]:
+        """Return a snapshot list of (key, value) pairs atomically.
+        This avoids KeyError crashes if the dict is mutated during iteration.
+        """
         with self.lock:
-            return collections.abc.ItemsView(self)
+            return list(self._dict.items())
 
     def keys(self) -> collections.abc.KeysView[KT]:
         """Return a view of keys atomically."""

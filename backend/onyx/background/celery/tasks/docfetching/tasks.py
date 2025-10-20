@@ -474,10 +474,17 @@ def docfetching_proxy_task(
                 index_attempt.connector_credential_pair.connector.source.value
             )
 
+        # Track activity timeout for connector run
+        last_activity = time.monotonic()
         while True:
             sleep(5)
 
-            time.monotonic()
+            # Activity timeout: terminate long-stuck connectors
+            now = time.monotonic()
+            if now - last_activity >= CELERY_INDEXING_WATCHDOG_CONNECTOR_TIMEOUT:
+                result.status = IndexingWatchdogTerminalStatus.TERMINATED_BY_ACTIVITY_TIMEOUT
+                job.cancel()
+                break
 
             # if the job is done, clean up and break
             if job.done():
