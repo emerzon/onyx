@@ -58,13 +58,14 @@ def update_token_limit_settings(
     _: User | None = Depends(current_admin_user),
     db_session: Session = Depends(get_session),
 ) -> TokenRateLimitDisplay:
-    return TokenRateLimitDisplay.from_db(
-        update_token_rate_limit(
-            db_session=db_session,
-            token_rate_limit_id=token_rate_limit_id,
-            token_rate_limit_settings=token_limit_settings,
-        )
+    updated = update_token_rate_limit(
+        db_session=db_session,
+        token_rate_limit_id=token_rate_limit_id,
+        token_rate_limit_settings=token_limit_settings,
     )
+    # Invalidate cached availability so enforcement reflects updates immediately
+    any_rate_limit_exists.cache_clear()
+    return TokenRateLimitDisplay.from_db(updated)
 
 
 @router.delete("/rate-limit/{token_rate_limit_id}")
@@ -73,7 +74,10 @@ def delete_token_limit_settings(
     _: User | None = Depends(current_admin_user),
     db_session: Session = Depends(get_session),
 ) -> None:
-    return delete_token_rate_limit(
+    delete_token_rate_limit(
         db_session=db_session,
         token_rate_limit_id=token_rate_limit_id,
     )
+    # Invalidate cache in case this was the last enabled limit
+    any_rate_limit_exists.cache_clear()
+    return None
