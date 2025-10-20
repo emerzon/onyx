@@ -171,6 +171,9 @@ def validate_active_indexing_attempts(
         for attempt in active_attempts:
             lock_beat.reacquire()
 
+            # Reset timeout for each attempt to avoid cross-attempt pollution
+            heartbeat_timeout_seconds = HEARTBEAT_TIMEOUT_SECONDS
+
             # Double-check the attempt still exists and has the same status
             fresh_attempt = get_index_attempt(db_session, attempt.id)
             if not fresh_attempt or fresh_attempt.status.is_terminal():
