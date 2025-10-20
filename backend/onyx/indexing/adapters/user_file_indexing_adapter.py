@@ -127,14 +127,14 @@ class UserFileIndexingAdapter:
             )
         }
 
+        # Build a fast lookup of chunks per user_file_id to avoid O(N_files * N_chunks)
+        chunks_by_user_file: dict[str, list[IndexChunk]] = {}
+        for chunk in chunks_with_embeddings:
+            fid = chunk.source_document.id
+            chunks_by_user_file.setdefault(fid, []).append(chunk)
+
         user_file_id_to_new_chunk_cnt: dict[str, int] = {
-            user_file_id: len(
-                [
-                    chunk
-                    for chunk in chunks_with_embeddings
-                    if chunk.source_document.id == user_file_id
-                ]
-            )
+            user_file_id: len(chunks_by_user_file.get(user_file_id, []))
             for user_file_id in updatable_ids
         }
 
@@ -152,11 +152,7 @@ class UserFileIndexingAdapter:
         user_file_id_to_raw_text: dict[str, str] = {}
         user_file_id_to_token_count: dict[str, int | None] = {}
         for user_file_id in updatable_ids:
-            user_file_chunks = [
-                chunk
-                for chunk in chunks_with_embeddings
-                if chunk.source_document.id == user_file_id
-            ]
+            user_file_chunks = chunks_by_user_file.get(user_file_id, [])
             if user_file_chunks:
                 combined_content = " ".join(
                     [chunk.content for chunk in user_file_chunks]
