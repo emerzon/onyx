@@ -1393,8 +1393,10 @@ def _docprocessing_task(
                 adapter=adapter,
             )
 
-        # Update batch completion and document counts atomically using database coordination
+        # Clean up this batch before updating counters to avoid double-counting on retry
+        storage.delete_batch_by_num(batch_num)
 
+        # Update batch completion and document counts atomically using database coordination
         with get_session_with_current_tenant() as db_session, cross_batch_db_lock:
             IndexingCoordination.update_batch_completion_and_docs(
                 db_session=db_session,
