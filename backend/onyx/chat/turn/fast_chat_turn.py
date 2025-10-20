@@ -164,7 +164,7 @@ def _emit_clean_up_packets(
             Packet(
                 ind=ctx.current_run_step,
                 obj=MessageStart(
-                    type="message_start", content="Cancelled", final_documents=None
+                    type="message_start", content="", final_documents=None
                 ),
             )
         )
